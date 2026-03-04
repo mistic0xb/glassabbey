@@ -200,8 +200,6 @@ const AddPieces = () => {
     }
   };
 
-  const allPiecesForDisplay = [...savedPieces, ...buildNewPieces()];
-
   return (
     <div style={{ minHeight: "100vh", padding: "3rem 1.5rem 6rem", maxWidth: "1200px", margin: "0 auto" }}>
 
