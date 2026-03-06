@@ -11,6 +11,7 @@ export interface Collection {
 export interface Piece {
     id: string;          // d-tag (uuid)
     collectionId: string; // references Collection d-tag
+    creatorPubkey: string;
     makerName: string;
     artifactName: string;
     size?: string;

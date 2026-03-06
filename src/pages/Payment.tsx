@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { QRCodeSVG } from "qrcode.react";
+import { FiCheck, FiCopy, FiZap, FiArrowLeft } from "react-icons/fi";
 import { generatePieceInvoice, monitorZapPayment } from "../libs/nostr/nip57";
 import { publishBid } from "../libs/nostr/bid";
 import type { Piece } from "../types/types";
@@ -26,44 +27,25 @@ const Payment = () => {
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState<
-    "idle" | "waiting" | "publishing" | "confirmed"
-  >("idle");
+  const [status, setStatus] = useState<"idle" | "waiting" | "publishing" | "confirmed">("idle");
 
-  if (!state) {
-    navigate(-1);
-    return null;
-  }
+  if (!state) { navigate(-1); return null; }
 
-  const {
-    piece,
-    collectionName,
-    lightningAddress,
-    recipientPubkey,
-    willingAmt,
-    submitAmt,
-    bidderName,
-  } = state;
+  const { piece, collectionName, lightningAddress, recipientPubkey, willingAmt, submitAmt, bidderName } = state;
 
-  // Generate invoice on mount
   useEffect(() => {
     const generate = async () => {
       setGenerating(true);
       setError(null);
       try {
         const result = await generatePieceInvoice({
-          lightningAddress,
-          amount: submitAmt,
-          pieceId: piece.id,
-          recipientPubkey,
-          bidderName,
+          lightningAddress, amount: submitAmt,
+          pieceId: piece.id, recipientPubkey, bidderName,
         });
         setInvoice(result.invoice);
         setStatus("waiting");
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to generate invoice",
-        );
+        setError(err instanceof Error ? err.message : "Failed to generate invoice");
       } finally {
         setGenerating(false);
       }
@@ -71,39 +53,20 @@ const Payment = () => {
     generate();
   }, []);
 
-  // Monitor for payment once invoice is ready
   useEffect(() => {
     if (!invoice || status !== "waiting") return;
-
-    const unsubscribe = monitorZapPayment(
-      piece.id,
-      recipientPubkey,
-      async () => {
-        setStatus("publishing");
-        try {
-          await publishBid(piece.id, willingAmt, submitAmt);
-          setStatus("confirmed");
-          setTimeout(
-            () =>
-              navigate(`/piece/${piece.id}`, {
-                state: { piece, collectionName },
-              }),
-            3000,
-          );
-        } catch (err) {
-          console.error("Failed to publish bid after payment:", err);
-          setStatus("confirmed"); // still confirmed, just bid publish failed silently
-          setTimeout(
-            () =>
-              navigate(`/piece/${piece.id}`, {
-                state: { piece, collectionName },
-              }),
-            3000,
-          );
-        }
-      },
-    );
-
+    const unsubscribe = monitorZapPayment(piece.id, recipientPubkey, async () => {
+      setStatus("publishing");
+      try {
+        await publishBid(piece.id, willingAmt, submitAmt, bidderName);
+        setStatus("confirmed");
+        setTimeout(() => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }), 3000);
+      } catch (err) {
+        console.error("Failed to publish bid after payment:", err);
+        setStatus("confirmed");
+        setTimeout(() => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }), 3000);
+      }
+    });
     return () => unsubscribe();
   }, [invoice, status]);
 
@@ -119,287 +82,104 @@ const Payment = () => {
     window.location.href = `lightning:${invoice}`;
   };
 
-  // ── Confirmed state ──────────────────────────────────────────────
+  // Confirmed
   if (status === "confirmed" || status === "publishing") {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: "2rem",
-        }}
-      >
-        <div
-          className="frame-box"
-          style={{
-            padding: "3rem 2.5rem",
-            maxWidth: "420px",
-            width: "100%",
-            textAlign: "center",
-            display: "flex",
-            flexDirection: "column",
-            gap: "1.25rem",
-            alignItems: "center",
-          }}
-        >
-          <div style={{ fontSize: "3rem" }}>✓</div>
-          <h2
-            style={{
-              fontSize: "1.5rem",
-              fontWeight: 700,
-              color: "var(--gold-mid)",
-              margin: 0,
-            }}
-          >
-            Payment Confirmed
-          </h2>
-          <p
-            style={{
-              fontSize: "0.95rem",
-              color: "var(--silver-mid)",
-              margin: 0,
-            }}
-          >
-            {status === "publishing"
-              ? "Publishing your bid…"
-              : "Bid recorded. Returning to piece…"}
-          </p>
-          <div style={{ fontSize: "0.85rem", color: "var(--silver-dark)" }}>
-            <span style={{ color: "var(--gold-dim)" }}>{bidderName}</span> ·{" "}
-            {formatSats(submitAmt)} sats
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="border border-white/10 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-white/2">
+          <div className="w-16 h-16 rounded-full bg-green-500/10 border border-green-500/30 flex items-center justify-center">
+            <FiCheck className="text-green-400 text-3xl" />
+          </div>
+          <div>
+            <h2 className="text-white font-bold text-xl mb-1">Payment Confirmed</h2>
+            <p className="text-white/40 text-sm">
+              {status === "publishing" ? "Publishing your bid…" : "Bid recorded. Returning to piece…"}
+            </p>
+          </div>
+          <div className="border border-white/10 rounded px-4 py-2 text-sm">
+            <span className="text-white/60">{bidderName}</span>
+            <span className="text-white/20 mx-2">·</span>
+            <span className="text-green-400 font-semibold">{formatSats(submitAmt)} sats</span>
           </div>
         </div>
       </div>
     );
   }
 
-  // ── Generating state ─────────────────────────────────────────────
+  // Generating 
   if (generating) {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        <p
-          className="anim-pulse-gold"
-          style={{
-            fontSize: "0.9rem",
-            color: "var(--gold-dim)",
-            letterSpacing: "0.15em",
-          }}
-        >
-          Generating invoice…
-        </p>
+      <div className="min-h-screen flex items-center justify-center">
+        <p className="text-white/30 text-sm">Generating invoice…</p>
       </div>
     );
   }
 
-  // ── Error state ──────────────────────────────────────────────────
+  // Error
   if (error) {
     return (
-      <div
-        style={{
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: "2rem",
-        }}
-      >
-        <div
-          className="frame-box"
-          style={{
-            padding: "2rem",
-            maxWidth: "420px",
-            width: "100%",
-            textAlign: "center",
-            display: "flex",
-            flexDirection: "column",
-            gap: "1rem",
-            alignItems: "center",
-          }}
-        >
-          <p
-            style={{
-              fontSize: "0.95rem",
-              color: "var(--text-secondary)",
-              margin: 0,
-            }}
-          >
-            {error}
-          </p>
-          <button
-            className="btn-primary"
-            onClick={() => navigate(-1)}
-            style={{ padding: "0.7rem 1.5rem", fontSize: "0.9rem" }}
-          >
-            ← Go Back
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="border border-white/10 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-white/2">
+          <p className="text-red-400 text-sm">{error}</p>
+          <button onClick={() => navigate(-1)}
+            className="flex items-center gap-2 px-5 py-2.5 border border-white/15 hover:border-white/30 text-white/60 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer">
+            <FiArrowLeft /> Go Back
           </button>
         </div>
       </div>
     );
   }
 
-  // ── Invoice / QR state ───────────────────────────────────────────
+  // Invoice / QR
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "2rem",
-      }}
-    >
-      <div
-        className="frame-box"
-        style={{
-          padding: "2.5rem",
-          maxWidth: "420px",
-          width: "100%",
-          display: "flex",
-          flexDirection: "column",
-          gap: "1.75rem",
-        }}
-      >
+    <div className="min-h-screen flex items-center justify-center p-4">
+      <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
+
         {/* Header */}
         <div>
-          <p
-            style={{
-              fontSize: "0.75rem",
-              letterSpacing: "0.2em",
-              color: "var(--gold-dim)",
-              textTransform: "uppercase",
-              margin: 0,
-              marginBottom: "0.4rem",
-            }}
-          >
-            {collectionName}
-          </p>
-          <h1
-            style={{
-              fontSize: "1.3rem",
-              fontWeight: 600,
-              color: "var(--gold-mid)",
-              margin: 0,
-            }}
-          >
-            {piece.artifactName}
-          </h1>
-          <p
-            style={{
-              fontSize: "0.85rem",
-              color: "var(--silver-dark)",
-              margin: "0.25rem 0 0",
-            }}
-          >
-            Bidding as{" "}
-            <strong style={{ color: "var(--gold-mid)" }}>{bidderName}</strong>
+          <p className="text-white/30 text-xs uppercase tracking-widest mb-1">{collectionName}</p>
+          <h1 className="text-white font-semibold text-lg">{piece.artifactName}</h1>
+          <p className="text-white/40 text-sm mt-1">
+            Bidding as <span className="text-white/70">{bidderName}</span>
           </p>
         </div>
 
         {/* Amount */}
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            padding: "1rem 1.25rem",
-            background: "var(--bg-elevated)",
-            border: "1px solid var(--border-subtle)",
-            borderRadius: "4px",
-          }}
-        >
-          <span style={{ fontSize: "0.85rem", color: "var(--silver-dark)" }}>
-            Submit amount
-          </span>
-          <span
-            className="shimmer-text"
-            style={{ fontSize: "1.4rem", fontWeight: 700 }}
-          >
-            {formatSats(submitAmt)} sats
-          </span>
+        <div className="flex justify-between items-center bg-white/5 border border-white/10 rounded-lg px-4 py-3">
+          <span className="text-white/40 text-sm">Submit amount</span>
+          <span className="text-green-400 font-bold text-xl">{formatSats(submitAmt)} sats</span>
         </div>
 
         {/* QR */}
         {invoice && (
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              gap: "1rem",
-            }}
-          >
-            <div
-              style={{
-                background: "white",
-                padding: "1rem",
-                borderRadius: "4px",
-              }}
-            >
-              <QRCodeSVG value={invoice} size={220} level="M" />
+          <div className="flex flex-col items-center gap-3">
+            <div className="bg-white p-3 rounded-lg">
+              <QRCodeSVG value={invoice} size={200} level="M" />
             </div>
-            <button
-              onClick={handleCopy}
-              style={{
-                background: "none",
-                border: "none",
-                cursor: "pointer",
-                fontSize: "0.85rem",
-                color: "var(--silver-mid)",
-              }}
-            >
-              {copied ? "✓ Copied" : "Copy invoice"}
+            <button onClick={handleCopy}
+              className="flex items-center gap-2 text-white/40 hover:text-white text-sm transition-colors bg-transparent border-none cursor-pointer">
+              {copied ? <><FiCheck className="text-green-400" /> Copied</> : <><FiCopy /> Copy invoice</>}
             </button>
           </div>
         )}
 
-        {/* Waiting indicator */}
-        <p
-          className="anim-pulse-gold"
-          style={{
-            fontSize: "0.8rem",
-            color: "var(--gold-dim)",
-            textAlign: "center",
-            margin: 0,
-          }}
-        >
+        {/* Waiting */}
+        <p className="text-white/20 text-xs text-center animate-pulse">
           Waiting for payment…
         </p>
 
         {/* Actions */}
-        <div
-          style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}
-        >
-          <button
-            className="btn-primary"
-            onClick={handleOpenWallet}
-            style={{ padding: "0.85rem", fontSize: "1rem", fontWeight: 600 }}
-          >
-            Open in Wallet
+        <div className="flex flex-col gap-2">
+          <button onClick={handleOpenWallet}
+            className="flex items-center justify-center gap-2 w-full py-3 bg-green-600 hover:bg-green-500 text-white text-sm font-semibold rounded transition-colors border-none cursor-pointer">
+            <FiZap /> Open in Wallet
           </button>
-          <button
-            onClick={() => navigate(-1)}
-            style={{
-              background: "none",
-              border: "1px solid var(--border-subtle)",
-              borderRadius: "4px",
-              padding: "0.7rem",
-              fontSize: "0.9rem",
-              color: "var(--silver-dark)",
-              cursor: "pointer",
-            }}
-          >
+          <button onClick={() => navigate(-1)}
+            className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer">
             Cancel
           </button>
         </div>
+
       </div>
     </div>
   );

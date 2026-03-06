@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { useLocation, useNavigate, useParams } from "react-router";
+import { useNavigate, useParams } from "react-router";
 import {
   uniqueNamesGenerator,
   adjectives,
@@ -8,7 +8,9 @@ import {
 } from "unique-names-generator";
 import { generateSecretKey, getPublicKey } from "nostr-tools";
 import { fetchBidsForPiece, type Bid } from "../libs/nostr/bid";
-import type { Piece } from "../types/types";
+import { fetchPieceById } from "../libs/nostr/pieces";
+import { fetchAllCollections } from "../libs/nostr/collection";
+import type { Piece, Collection } from "../types/types";
 
 const getBidderName = (pubkey: string): string =>
   uniqueNamesGenerator({
@@ -20,64 +22,111 @@ const getBidderName = (pubkey: string): string =>
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
-
 const WILLING_PRESETS = [10, 2000, 4000, 10000, 21000];
 const SUBMIT_PRESETS = [10, 2000, 3000];
 
-interface BiddingState {
-  piece: Piece;
-  collectionName: string;
-  lightningAddress: string;  // from Collection
-  recipientPubkey: string;   // collection owner's pubkey
-}
+const PresetBtn = ({
+  amt,
+  selected,
+  onSelect,
+}: {
+  amt: number;
+  selected: number | null;
+  onSelect: (n: number) => void;
+}) => (
+  <button
+    onClick={() => onSelect(amt)}
+    className={`px-4 py-2 text-sm rounded border transition-all cursor-pointer ${
+      selected === amt
+        ? "border-green-500 bg-green-500/10 text-green-400"
+        : "border-white/10 bg-white/5 text-white/50 hover:border-white/25 hover:text-white/80"
+    }`}
+  >
+    {formatSats(amt)} sats
+  </button>
+);
 
 const BiddingPage = () => {
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
-  const { state } = useLocation() as { state: BiddingState | null };
+
+  const [piece, setPiece] = useState<Piece | null>(null);
+  const [collection, setCollection] = useState<Collection | null>(null);
+  const [loadingPiece, setLoadingPiece] = useState(true);
 
   const [bids, setBids] = useState<Bid[]>([]);
   const [loadingBids, setLoadingBids] = useState(true);
-
   const [willingAmt, setWillingAmt] = useState<number | null>(null);
   const [submitAmt, setSubmitAmt] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
-
-  // Stable throwaway identity for this session
-  const [myPubkey] = useState(() => getPublicKey(generateSecretKey()));
   const [bidderName, setBidderName] = useState("");
-  const displayName = bidderName.trim() || getBidderName(myPubkey);
 
+  const [myPubkey] = useState(() => getPublicKey(generateSecretKey()));
+  const fallbackName = getBidderName(myPubkey);
+  const displayName =
+    bidderName.trim() !== "" ? bidderName.trim() : fallbackName;
+
+  // Fetch piece + collection from relay
   useEffect(() => {
     if (!id) return;
+    const load = async () => {
+      setLoadingPiece(true);
+      const fetchedPiece = await fetchPieceById(id);
+      if (!fetchedPiece) {
+        navigate(-1);
+        return;
+      }
+      setPiece(fetchedPiece);
+
+      // Fetch collection using collectionId + creatorPubkey
+      const allCollections = await fetchAllCollections(200);
+      const match = allCollections.find(
+        (c) =>
+          c.id === fetchedPiece.collectionId &&
+          c.pubkey === fetchedPiece.creatorPubkey,
+      );
+      setCollection(match ?? null);
+      setLoadingPiece(false);
+    };
+    load();
+  }, [id]);
+
+  // Fetch bids
+  const fetchBids = () => {
+    if (!id) return;
+    setLoadingBids(true);
     fetchBidsForPiece(id).then((fetched) => {
       setBids(fetched);
       setLoadingBids(false);
     });
+  };
+
+  useEffect(() => {
+    fetchBids();
   }, [id]);
 
-  if (!state) {
-    navigate(-1);
-    return null;
-  }
-  const { piece, collectionName, lightningAddress, recipientPubkey } = state;
+  // Refetch bids on window focus (after returning from payment)
+  useEffect(() => {
+    window.addEventListener("focus", fetchBids);
+    return () => window.removeEventListener("focus", fetchBids);
+  }, [id]);
 
   const highestWilling = useMemo(
     () => Math.max(0, ...bids.map((b) => b.willingAmt)),
-    [bids]
+    [bids],
   );
   const highestSubmit = useMemo(
     () => Math.max(0, ...bids.map((b) => b.submitAmt)),
-    [bids]
+    [bids],
   );
-
-  const value = highestWilling;
+  const value = highestWilling + highestSubmit;
   const price = highestWilling - highestSubmit;
 
-  const canSubmit = !!willingAmt && !!submitAmt && !submitting;
+  const canSubmit =
+    !!willingAmt && !!submitAmt && !submitting && !!piece && !!collection;
 
-  const handleSubmitBid = async () => {
-    if (!canSubmit) return;
+  const handleSubmitBid = () => {
+    if (!canSubmit || !piece || !collection) return;
     setSubmitting(true);
     const slug = piece.artifactName
       .toLowerCase()
@@ -86,9 +135,9 @@ const BiddingPage = () => {
     navigate(`/payment/${slug}/${piece.id}`, {
       state: {
         piece,
-        collectionName,
-        lightningAddress,
-        recipientPubkey,
+        collectionName: collection.name,
+        lightningAddress: collection.lightningAddress,
+        recipientPubkey: collection.pubkey,
         willingAmt,
         submitAmt,
         bidderName: displayName,
@@ -104,232 +153,174 @@ const BiddingPage = () => {
     return `Bid ${formatSats(submitAmt)} sats →`;
   };
 
-  const PresetBtn = ({
-    amt,
-    selected,
-    onSelect,
-  }: {
-    amt: number;
-    selected: number | null;
-    onSelect: (n: number) => void;
-  }) => {
-    const isSelected = selected === amt;
+  if (loadingPiece) {
     return (
-      <button
-        onClick={() => onSelect(amt)}
-        style={{
-          padding: "0.6rem 1.1rem",
-          fontSize: "0.9rem",
-          fontWeight: 500,
-          fontFamily: "inherit",
-          border: `2px solid ${isSelected ? "var(--gold-mid)" : "var(--border-subtle)"}`,
-          background: isSelected
-            ? "color-mix(in srgb, var(--gold-mid) 15%, var(--bg-elevated))"
-            : "var(--bg-elevated)",
-          color: isSelected ? "var(--gold-mid)" : "var(--silver-mid)",
-          cursor: "pointer",
-          borderRadius: "4px",
-          transition: "all 0.15s ease",
-        }}
-        onMouseEnter={(e) => {
-          if (!isSelected) e.currentTarget.style.borderColor = "var(--gold-dim)";
-        }}
-        onMouseLeave={(e) => {
-          if (!isSelected) e.currentTarget.style.borderColor = "var(--border-subtle)";
-        }}
-      >
-        {formatSats(amt)} sats
-      </button>
+      <div className="min-h-screen flex items-center justify-center">
+        <p className="text-white/30 text-sm">Loading piece…</p>
+      </div>
     );
-  };
+  }
+
+  if (!piece) return null;
 
   return (
-    <div style={{ minHeight: "100vh", padding: "2.5rem 1.5rem 6rem", maxWidth: "1100px", margin: "0 auto" }}>
-
-      {/* Back */}
+    <div className="min-h-screen px-4 sm:px-6 py-8 max-w-5xl mx-auto">
       <button
         onClick={() => navigate(-1)}
-        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--silver-dark)", fontSize: "0.9rem", marginBottom: "2rem", padding: 0 }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--gold-mid)")}
-        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--silver-dark)")}
+        className="text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
       >
         ← Back
       </button>
 
-      <div style={{ display: "grid", gridTemplateColumns: "55% 45%", gap: "2.5rem", alignItems: "start" }}>
-
+      <div className="grid grid-cols-1 lg:grid-cols-[55%_45%] gap-6 items-start">
         {/* LEFT */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "1.25rem" }}>
-
-          {/* Piece card */}
-          <div className="frame-box" style={{ overflow: "hidden", background: "var(--bg-surface)" }}>
-            <div
-              style={{
-                height: "280px",
-                background: piece.imageUrl
-                  ? `url(${piece.imageUrl}) center/cover no-repeat`
-                  : "linear-gradient(135deg, var(--bg-elevated) 0%, var(--bg-overlay) 100%)",
-                display: "flex", alignItems: "center", justifyContent: "center",
-              }}
-            >
-              {!piece.imageUrl && (
-                <div className="w-12 h-12 rotate-45" style={{ border: "1px solid color-mix(in srgb, var(--gold-dim) 40%, transparent)" }} />
-              )}
+        <div className="flex flex-col gap-4">
+          <div className="rounded-lg overflow-hidden border border-white/10">
+            <div className="h-64 sm:h-72 overflow-hidden">
+              <img
+                src={
+                  piece.imageUrl ||
+                  "https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?w=600&h=400&fit=crop"
+                }
+                alt={piece.artifactName}
+                className="w-full h-full object-cover"
+              />
             </div>
-            <div style={{ padding: "1.5rem", display: "flex", flexDirection: "column", gap: "0.6rem" }}>
-              <p style={{ fontSize: "0.75rem", letterSpacing: "0.2em", color: "var(--gold-dim)", textTransform: "uppercase", margin: 0 }}>
-                {collectionName}
+            <div className="p-5 flex flex-col gap-2 border-t border-white/10">
+              <p className="text-white/30 text-xs uppercase tracking-widest">
+                {collection?.name}
               </p>
-              <hr className="divider-gold" />
-              <h1 style={{ fontSize: "1.4rem", fontWeight: 600, color: "var(--gold-mid)", lineHeight: 1.3, margin: 0 }}>
-                {piece.artifactName}
-              </h1>
-              <p style={{ fontSize: "0.95rem", color: "var(--text-secondary)", margin: 0 }}>
-                by {piece.makerName}
-              </p>
+              <div className="border-t border-white/10 pt-3">
+                <h1 className="text-white font-semibold text-xl">
+                  {piece.artifactName}
+                </h1>
+                <p className="text-white/50 text-sm italic mt-1">
+                  by {piece.makerName}
+                </p>
+              </div>
               {piece.size && (
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "0.25rem", paddingTop: "0.5rem", borderTop: "1px solid var(--border-subtle)" }}>
-                  <span style={{ fontSize: "0.75rem", letterSpacing: "0.15em", color: "var(--gold-dim)", textTransform: "uppercase" }}>Size</span>
-                  <span style={{ fontSize: "0.9rem", color: "var(--silver-light)" }}>{piece.size}</span>
+                <div className="border-t border-white/10 pt-3 flex justify-between items-center">
+                  <span className="text-white/30 text-xs uppercase tracking-widest">
+                    Size
+                  </span>
+                  <span className="text-white/70 text-sm">{piece.size}</span>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Value & Price */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem" }}>
+          <div className="grid grid-cols-2 gap-3">
             {[
-              { label: "Value", value, hint: "highest willing bid" },
-              { label: "Price", value: price, hint: "willing − submit" },
-            ].map(({ label, value: v, hint }) => (
-              <div key={label} className="frame-box" style={{ padding: "1.25rem" }}>
-                <p style={{ fontSize: "0.75rem", letterSpacing: "0.2em", color: "var(--gold-dim)", textTransform: "uppercase", margin: 0, marginBottom: "0.5rem" }}>
+              { label: "Value", val: value, hint: "willing + submit" },
+              { label: "Price", val: price, hint: "willing − submit" },
+            ].map(({ label, val, hint }) => (
+              <div
+                key={label}
+                className="border border-white/10 rounded-lg p-4 bg-white/2"
+              >
+                <p className="text-white/30 text-xs uppercase tracking-widest mb-2">
                   {label}
                 </p>
-                <p className="shimmer-text" style={{ fontSize: "1.5rem", fontWeight: 700, margin: 0 }}>
-                  {v > 0 ? `${formatSats(v)} sats` : "—"}
+                <p className="text-yellow-400 font-bold text-xl">
+                  {val > 0 ? `${val.toLocaleString()} sats` : "—"}
                 </p>
-                <p style={{ fontSize: "0.75rem", color: "var(--silver-dark)", margin: "0.25rem 0 0" }}>
-                  {hint}
-                </p>
+                <p className="text-white/20 text-xs mt-1">{hint}</p>
               </div>
             ))}
           </div>
         </div>
 
         {/* RIGHT */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
-
-          {/* Willing to bid */}
-          <div className="frame-box" style={{ padding: "1.5rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
-            <div>
-              <p style={{ fontSize: "1rem", fontWeight: 600, color: "var(--gold-muted)", margin: 0, marginBottom: "0.3rem" }}>
-                Willing to Bid
-              </p>
-              <p style={{ fontSize: "0.85rem", color: "var(--silver-dark)", margin: 0 }}>
-                The maximum you'd consider paying
-              </p>
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
-              {WILLING_PRESETS.map((amt) => (
-                <PresetBtn key={amt} amt={amt} selected={willingAmt} onSelect={setWillingAmt} />
-              ))}
-            </div>
-          </div>
-
-          {/* Submit amount */}
-          <div className="frame-box" style={{ padding: "1.5rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
-            <div>
-              <p style={{ fontSize: "1rem", fontWeight: 600, color: "var(--gold-muted)", margin: 0, marginBottom: "0.3rem" }}>
-                Submit Amount
-              </p>
-              <p style={{ fontSize: "0.85rem", color: "var(--silver-dark)", margin: 0 }}>
-                Your firm offer — payment required
-              </p>
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
-              {SUBMIT_PRESETS.map((amt) => (
-                <PresetBtn key={amt} amt={amt} selected={submitAmt} onSelect={setSubmitAmt} />
-              ))}
-            </div>
-          </div>
-
-          {/* Bidder name */}
-          <div className="frame-box" style={{ padding: "1.5rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            <p style={{ fontSize: "1rem", fontWeight: 600, color: "var(--gold-muted)", margin: 0 }}>
-              Bidder Name
+        <div className="flex flex-col gap-4">
+          <div className="border border-white/10 rounded-lg p-5 bg-white/2">
+            <p className="text-white font-semibold text-sm mb-1">
+              Willing to Bid
             </p>
+            <p className="text-white/40 text-xs mb-4">
+              The maximum you'd consider paying
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {WILLING_PRESETS.map((amt) => (
+                <PresetBtn
+                  key={amt}
+                  amt={amt}
+                  selected={willingAmt}
+                  onSelect={setWillingAmt}
+                />
+              ))}
+            </div>
+          </div>
+
+          <div className="border border-white/10 rounded-lg p-5 bg-white/2">
+            <p className="text-white font-semibold text-sm mb-1">
+              Submit Amount
+            </p>
+            <p className="text-white/40 text-xs mb-4">
+              Your firm offer — payment required
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {SUBMIT_PRESETS.map((amt) => (
+                <PresetBtn
+                  key={amt}
+                  amt={amt}
+                  selected={submitAmt}
+                  onSelect={setSubmitAmt}
+                />
+              ))}
+            </div>
+          </div>
+
+          <div className="border border-white/10 rounded-lg p-5 bg-white/2">
+            <p className="text-white font-semibold text-sm mb-1">Bidder Name</p>
             <input
               value={bidderName}
               onChange={(e) => setBidderName(e.target.value)}
-              placeholder={getBidderName(myPubkey)}
-              style={{
-                padding: "0.6rem 0.9rem",
-                fontSize: "0.9rem",
-                background: "var(--bg-elevated)",
-                border: "1px solid var(--border-subtle)",
-                borderRadius: "4px",
-                color: "var(--silver-light)",
-                outline: "none",
-                width: "100%",
-                boxSizing: "border-box",
-              }}
+              placeholder={fallbackName}
+              className="w-full bg-white/5 border border-white/10 focus:border-white/30 outline-none text-white text-sm px-3 py-2 rounded transition-colors placeholder:text-white/20 mt-2"
             />
-            <p style={{ fontSize: "0.8rem", color: "var(--silver-dark)", margin: 0 }}>
-              Bidding as <strong style={{ color: "var(--gold-mid)" }}>{displayName}</strong>
+            <p className="text-white/30 text-xs mt-2">
+              Bidding as <span className="text-white/60">{displayName}</span>
             </p>
           </div>
 
-          {/* Bids list */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-              <p style={{ fontSize: "1rem", fontWeight: 600, color: "var(--gold-muted)", margin: 0 }}>
-                All Bids
-              </p>
+          <div className="border border-white/10 rounded-lg p-5 bg-white/2">
+            <div className="flex justify-between items-center mb-4">
+              <p className="text-white font-semibold text-sm">All Bids</p>
               {!loadingBids && bids.length > 0 && (
-                <p style={{ fontSize: "0.85rem", color: "var(--silver-dark)", margin: 0 }}>
+                <span className="text-white/30 text-xs">
                   {bids.length} total
-                </p>
+                </span>
               )}
             </div>
-
             {loadingBids ? (
-              <p className="anim-pulse-gold" style={{ fontSize: "0.85rem", color: "var(--gold-dim)", padding: "1rem 0", margin: 0 }}>
-                Loading bids…
-              </p>
+              <p className="text-white/30 text-sm py-2">Loading bids…</p>
             ) : bids.length === 0 ? (
-              <div className="frame-box" style={{ padding: "1.5rem", textAlign: "center" }}>
-                <p style={{ fontSize: "0.9rem", color: "var(--silver-dark)", margin: 0 }}>
-                  No bids yet. Be the first.
-                </p>
-              </div>
+              <p className="text-white/20 text-sm text-center py-4">
+                No bids yet. Be the first.
+              </p>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", maxHeight: "220px", overflowY: "auto" }}>
+              <div className="flex flex-col gap-1.5 max-h-52 overflow-y-auto">
                 {bids.map((bid, i) => (
                   <div
                     key={bid.id}
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "2rem 1fr auto auto",
-                      alignItems: "center",
-                      gap: "0.75rem",
-                      padding: "0.75rem 1rem",
-                      background: i === 0 ? "color-mix(in srgb, var(--gold-mid) 8%, var(--bg-surface))" : "var(--bg-surface)",
-                      border: `1px solid ${i === 0 ? "color-mix(in srgb, var(--gold-mid) 30%, transparent)" : "var(--border-subtle)"}`,
-                      borderRadius: "4px",
-                    }}
+                    className={`grid grid-cols-[1.5rem_1fr_auto] items-center gap-3 px-3 py-2.5 rounded border text-sm ${
+                      i === 0
+                        ? "border-green-500/20 bg-green-500/5"
+                        : "border-white/5 bg-white/1"
+                    }`}
                   >
-                    <span style={{ fontSize: "0.75rem", color: i === 0 ? "var(--gold-mid)" : "var(--silver-dark)", fontWeight: 600 }}>
+                    <span
+                      className={`text-xs font-semibold ${i === 0 ? "text-green-400" : "text-white/20"}`}
+                    >
                       #{i + 1}
                     </span>
-                    <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {getBidderName(bid.pubkey)}
+                    <span className="text-white/50 truncate text-xs">
+                      {bid.bidderName || getBidderName(bid.pubkey)}
                     </span>
-                    <span style={{ fontSize: "0.75rem", color: "var(--silver-dark)", whiteSpace: "nowrap" }}>
-                      w: {formatSats(bid.willingAmt)}
-                    </span>
-                    <span style={{ fontSize: "0.95rem", fontWeight: 700, color: "var(--gold-mid)", flexShrink: 0 }}>
-                      {formatSats(bid.submitAmt)} sats
+                    <span
+                      className={`font-semibold text-xs whitespace-nowrap ${i === 0 ? "text-green-400" : "text-white/60"}`}
+                    >
+                      {bid.willingAmt.toLocaleString()} sats
                     </span>
                   </div>
                 ))}
@@ -337,23 +328,13 @@ const BiddingPage = () => {
             )}
           </div>
 
-          {/* Submit */}
           <button
-            className="btn-primary"
             onClick={handleSubmitBid}
             disabled={!canSubmit}
-            style={{
-              padding: "0.85rem",
-              width: "100%",
-              fontSize: "1rem",
-              fontWeight: 600,
-              opacity: canSubmit ? 1 : 0.5,
-              cursor: canSubmit ? "pointer" : "not-allowed",
-            }}
+            className="w-full py-3 bg-green-600 hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold rounded transition-colors border-none cursor-pointer"
           >
             {submitLabel()}
           </button>
-
         </div>
       </div>
     </div>

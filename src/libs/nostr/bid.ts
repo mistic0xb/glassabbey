@@ -6,6 +6,7 @@ import { getPool, DEFAULT_RELAYS } from "./pool";
 export interface Bid {
   id: string;
   pieceId: string;
+  bidderName?: string;
   willingAmt: number;
   submitAmt: number;
   createdAt: number;
@@ -39,6 +40,7 @@ export async function fetchBidsForPiece(pieceId: string): Promise<Bid[]> {
           seen.add(event.id);
           try {
             const data = JSON.parse(event.content) as {
+              bidderName?: string;
               willingAmt: number;
               submitAmt: number;
             };
@@ -46,6 +48,7 @@ export async function fetchBidsForPiece(pieceId: string): Promise<Bid[]> {
             bids.push({
               id: event.id,
               pieceId,
+              bidderName: data.bidderName,
               willingAmt: data.willingAmt,
               submitAmt: data.submitAmt,
               createdAt: event.created_at,
@@ -68,7 +71,8 @@ export async function fetchBidsForPiece(pieceId: string): Promise<Bid[]> {
 export async function publishBid(
   pieceId: string,
   willingAmt: number,
-  submitAmt: number
+  submitAmt: number,
+  bidderName?: string,
 ): Promise<string> {
   const sk = generateSecretKey();
   const pk = getPublicKey(sk);
@@ -81,7 +85,7 @@ export async function publishBid(
       ["t", "glassabbey-bid"],
       ["t", pieceBidTag(pieceId)],
     ],
-    content: JSON.stringify({ willingAmt, submitAmt }),
+    content: JSON.stringify({ willingAmt, submitAmt, bidderName }),
     pubkey: pk,
   };
 

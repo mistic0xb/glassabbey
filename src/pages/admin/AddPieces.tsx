@@ -48,7 +48,7 @@ const getPlaceholder = (id: string) =>
 
 const isValidUrl = (url: string) => /^https?:\/\/.+\..+/.test(url);
 
-// ── Field ─────────────────────────────────────────────────────────
+// Field 
 const Field = ({
   label,
   value,
@@ -79,7 +79,7 @@ const Field = ({
   </div>
 );
 
-// ── Image Input (URL or Upload) ───────────────────────────────────
+// Image Input (URL or Upload)
 const ImageInput = ({
   value,
   onChange,
@@ -164,8 +164,8 @@ const ImageInput = ({
   );
 };
 
-// ── Piece preview card ────────────────────────────────────────────
-const PieceCard = ({
+// Piece preview card
+export const PieceCard = ({
   piece,
   collectionName,
 }: {
@@ -204,7 +204,7 @@ const PieceCard = ({
   </div>
 );
 
-// ── Edit Collection Modal ─────────────────────────────────────────
+// Edit Collection Modal
 const EditCollectionModal = ({
   collection,
   onSave,
@@ -279,7 +279,6 @@ const EditCollectionModal = ({
   );
 };
 
-// ── Main ──────────────────────────────────────────────────────────
 const AddPieces = () => {
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
@@ -409,6 +408,7 @@ const AddPieces = () => {
     return validated.map((p) => ({
       id: crypto.randomUUID(),
       collectionId: collection.id,
+      creatorPubkey: userPubkey!,
       makerName: p.makerName.trim(),
       artifactName: p.artifactName.trim(),
       size: p.size.trim() || undefined,
