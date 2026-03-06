@@ -20,29 +20,43 @@ const App = () => {
     <BrowserRouter>
       <AuthProvider>
         <Navbar />
-        <main className="min-h-screen pt-16 md:pt-20">
-          <Routes>
-            <Route path="/" element={<Home />} />
-            <Route path="/explore" element={<Explore />} />
-            <Route path="/explore/:slug/:id" element={<ExploreCollection />} />
-            <Route path="/piece/:id" element={<BiddingPage />} />
-            <Route path="/payment/:slug/:id" element={<Payment />} />
-            <Route
-              path="/admin/dashboard"
-              element={<ProtectedRoute>
-                <Dashboard />
-              </ProtectedRoute>} />
-            <Route
-              path="/admin/collection/create"
-              element={<ProtectedRoute>
-                <CreateCollection />
-              </ProtectedRoute>} />
-            <Route
-              path="/admin/collection/:id/add-pieces"
-              element={<ProtectedRoute>
-                <AddPieces />
-              </ProtectedRoute>} />
-          </Routes>
+        <main className="min-h-screen bg-[url('/bg.webp')] bg-cover bg-center bg-fixed">
+          <div className="min-h-screen bg-black/70 backdrop-blur-sm">
+            <Routes>
+              <Route path="/" element={<Home />} />
+              <Route path="/explore" element={<Explore />} />
+              <Route
+                path="/explore/:slug/:id"
+                element={<ExploreCollection />}
+              />
+              <Route path="/piece/:id" element={<BiddingPage />} />
+              <Route path="/payment/:slug/:id" element={<Payment />} />
+              <Route
+                path="/admin/dashboard"
+                element={
+                  <ProtectedRoute>
+                    <Dashboard />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/admin/collection/create"
+                element={
+                  <ProtectedRoute>
+                    <CreateCollection />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/admin/collection/:id/add-pieces"
+                element={
+                  <ProtectedRoute>
+                    <AddPieces />
+                  </ProtectedRoute>
+                }
+              />
+            </Routes>
+          </div>
         </main>
       </AuthProvider>
     </BrowserRouter>
