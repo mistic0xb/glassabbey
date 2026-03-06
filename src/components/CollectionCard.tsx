@@ -8,6 +8,18 @@ interface Props {
   isDraft?: boolean;
 }
 
+const PLACEHOLDER_IMAGES = [
+  "https://static.vecteezy.com/system/resources/thumbnails/002/073/027/small/abstract-colorful-shapes-background-free-vector.jpg",
+  "https://static.vecteezy.com/system/resources/thumbnails/002/565/133/small/abstract-background-concept-free-vector.jpg",
+  "https://static.vecteezy.com/system/resources/thumbnails/002/072/763/small/colorful-abstract-background-free-vector.jpg",
+  "https://static.vecteezy.com/system/resources/thumbnails/000/155/039/small/colorful-abstract-doodle-vector.jpg",
+];
+
+const getPlaceholder = (id: string) => {
+  const index = id.charCodeAt(0) % PLACEHOLDER_IMAGES.length;
+  return PLACEHOLDER_IMAGES[index];
+};
+
 const CollectionCard = ({
   collection,
   pieceCount = 0,
@@ -16,143 +28,54 @@ const CollectionCard = ({
   const navigate = useNavigate();
 
   const handleClick = () => {
-    if (isDraft) {
-      // state is already in localStorage, just navigate — AddPieces reads it via getDraftById
-      navigate(`/admin/collection/${collection.id}/add-pieces`, {
-        state: { ...collection, isDraft: true },
-      });
-    } else {
-      navigate(`/admin/collection/${collection.id}/add-pieces`, {
-        state: { ...collection, isDraft: false },
-      });
-    }
+    navigate(`/admin/collection/${collection.id}/add-pieces`, {
+      state: { ...collection, isDraft },
+    });
   };
+
+  const bannerUrl = collection.bannerUrl || getPlaceholder(collection.id);
 
   return (
     <div
       onClick={handleClick}
-      className="frame-box cursor-pointer group transition-all duration-300"
-      style={{
-        background: "var(--bg-surface)",
-        border: "1px solid var(--border-subtle)",
-        overflow: "hidden",
-        transition: "border-color 0.3s ease",
-      }}
-      onMouseEnter={(e) =>
-        (e.currentTarget.style.borderColor = "var(--gold-muted)")
-      }
-      onMouseLeave={(e) =>
-        (e.currentTarget.style.borderColor = "var(--border-subtle)")
-      }
+      className="cursor-pointer rounded-lg overflow-hidden border border-white/10 hover:border-white/25 transition-colors bg-[#0e0d09] group"
     >
       {/* Banner */}
-      <div
-        style={{
-          height: "140px",
-          background: collection.bannerUrl
-            ? `url(${collection.bannerUrl}) center/cover no-repeat`
-            : "linear-gradient(135deg, var(--bg-elevated) 0%, var(--bg-overlay) 100%)",
-          position: "relative",
-        }}
-      >
-        {/* Draft badge */}
-        {isDraft && (
-          <div
-            style={{
-              position: "absolute",
-              top: "10px",
-              right: "10px",
-              background:
-                "color-mix(in srgb, var(--gold-dim) 30%, var(--bg-base))",
-              border: "1px solid var(--gold-dim)",
-              padding: "2px 10px",
-            }}
-          >
-            <span
-              className="font-display"
-              style={{
-                fontSize: "9px",
-                letterSpacing: "0.2em",
-                color: "var(--gold-muted)",
-              }}
-            >
-              DRAFT
-            </span>
-          </div>
-        )}
+      <div className="relative h-36 overflow-hidden">
+        <img
+          src={bannerUrl}
+          alt={collection.name}
+          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+        />
 
-        {/* No banner placeholder */}
-        {!collection.bannerUrl && (
-          <div className="w-full h-full flex items-center justify-center">
-            <div
-              className="w-8 h-8 rotate-45"
-              style={{
-                border:
-                  "1px solid color-mix(in srgb, var(--gold-dim) 40%, transparent)",
-              }}
-            />
-          </div>
+        {isDraft && (
+          <span className="absolute top-2 right-2 bg-black/70 border border-yellow-600/50 text-yellow-500 text-[10px] px-2 py-0.5 rounded">
+            DRAFT
+          </span>
         )}
       </div>
 
       {/* Content */}
-      <div
-        className="p-4"
-        style={{ borderTop: "1px solid var(--border-subtle)" }}
-      >
-        {/* Name */}
-        <h3
-          className="font-display truncate"
-          style={{
-            fontSize: "0.85rem",
-            letterSpacing: "0.1em",
-            color: "var(--gold-mid)",
-            marginBottom: "0.5rem",
-          }}
-        >
+      <div className="p-4 border-t border-white/10">
+        <h3 className="text-white font-semibold text-sm truncate mb-1">
           {collection.name}
         </h3>
 
-        {/* Lightning address */}
-        <p
-          className="font-body truncate"
-          style={{
-            fontSize: "0.75rem",
-            color: "var(--text-muted)",
-            marginBottom: "0.4rem",
-          }}
-        >
+        <p className="text-white/40 text-xs truncate mb-1">
           ⚡ {collection.lightningAddress}
         </p>
 
-        {/* Location */}
         {collection.location && (
-          <p
-            className="font-body truncate"
-            style={{
-              fontSize: "0.72rem",
-              color: "var(--silver-dark)",
-              marginBottom: "0.4rem",
-            }}
-          >
+          <p className="text-white/30 text-xs truncate mb-1">
             📍 {collection.location}
           </p>
         )}
 
-        {/* Divider */}
-        <hr className="divider-gold" style={{ margin: "0.75rem 0" }} />
-
-        {/* Piece count */}
-        <p
-          className="font-display"
-          style={{
-            fontSize: "0.68rem",
-            letterSpacing: "0.15em",
-            color: "var(--text-muted)",
-          }}
-        >
-          {pieceCount} {pieceCount === 1 ? "PIECE" : "PIECES"}
-        </p>
+        <div className="border-t border-white/10 mt-3 pt-3">
+          <p className="text-white/30 text-xs">
+            {pieceCount} {pieceCount === 1 ? "piece" : "pieces"}
+          </p>
+        </div>
       </div>
     </div>
   );
