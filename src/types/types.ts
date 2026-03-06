@@ -1,10 +1,11 @@
 export interface Collection {
-    id: string;          // d-tag (uuid)
+    id: string;
     pubkey?: string;
     name: string;
     lightningAddress: string;
     location?: string;
     bannerUrl?: string;
+    isDeleted?: boolean;
 }
 
 export interface Piece {

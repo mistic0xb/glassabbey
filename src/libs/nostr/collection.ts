@@ -29,16 +29,16 @@ export async function fetchCollectionsByCreator(
       },
       {
         onevent(event: Event) {
-          if (seen.has(event.id)) return;
-          seen.add(event.id);
+          const d = event.tags.find((t) => t[0] === "d")?.[1];
+          if (!d || seen.has(d)) return;
+          seen.add(d)
 
           try {
-            const d = event.tags.find((t) => t[0] === "d")?.[1];
-            if (!d) return;
-
+            if (!event.content?.trim()) return;
             const data = JSON.parse(event.content) as Omit<Collection, "id">;
-            if (!data.name || !data.lightningAddress) return;
 
+            if (!data.name || !data.lightningAddress) return;
+            if (data.isDeleted) return;
             collections.push({ id: d, ...data });
           } catch (err) {
             console.error("Failed to parse collection:", err);
@@ -75,13 +75,13 @@ export async function fetchAllCollections(limit = 200): Promise<Collection[]> {
       },
       {
         onevent(event: Event) {
-          if (seen.has(event.id)) return;
-          seen.add(event.id);
+          const d = event.tags.find((t) => t[0] === "d")?.[1];
+          if (!d || seen.has(d)) return;
+          seen.add(d);
           try {
-            const d = event.tags.find((t) => t[0] === "d")?.[1];
-            if (!d) return;
             const data = JSON.parse(event.content) as Omit<Collection, "id">;
             if (!data.name || !data.lightningAddress) return;
+            if (data.isDeleted) return;
             collections.push({ id: d, ...data, pubkey: event.pubkey });
           } catch (err) {
             console.error("Failed to parse collection:", err);
@@ -130,4 +130,32 @@ export async function publishCollection(
   await Promise.race([Promise.all(pubs), new Promise((r) => setTimeout(r, 5000))]);
 
   return id;
+}
+
+export async function deleteCollection(
+  collection: Collection
+): Promise<void> {
+  if (!window.nostr) throw new Error("Nostr extension not found");
+  const pool = getPool();
+
+  const content: Omit<Collection, "id"> = {
+    name: collection.name,
+    lightningAddress: collection.lightningAddress,
+    ...(collection.location ? { location: collection.location } : {}),
+    ...(collection.bannerUrl ? { bannerUrl: collection.bannerUrl } : {}),
+    isDeleted: true,
+  };
+
+  const signed = await window.nostr.signEvent({
+    kind: 30078,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [
+      ["d", collection.id],
+      ["t", "glassabbey-collection"],
+    ],
+    content: JSON.stringify(content),
+  }) as Event;
+
+  const pubs = pool.publish(DEFAULT_RELAYS, signed);
+  await Promise.race([Promise.all(pubs), new Promise((r) => setTimeout(r, 5000))]);
 }
