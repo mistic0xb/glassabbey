@@ -111,13 +111,18 @@ const Payment = () => {
 
     const recheckOnFocus = () => {
       if (handledRef.current) return;
-      // Re-subscribe once — monitorZapPayment will fire immediately if zap
-      // already exists on the relay (depends on your implementation doing a
-      // since: 0 or recent query on subscribe)
-      const unsub = monitorZapPayment(piece.id, recipientPubkey, () => {
-        unsub();
-        handlePaymentConfirmed();
-      });
+      // Use a since timestamp 3 mins in the past to catch zaps that landed
+      // while the page was backgrounded (WebSocket was suspended by the mobile OS)
+      const sinceTenMinsAgo = Math.floor(Date.now() / 1000) - 3 * 60;
+      const unsub = monitorZapPayment(
+        piece.id,
+        recipientPubkey,
+        () => {
+          unsub();
+          handlePaymentConfirmed();
+        },
+        sinceTenMinsAgo,
+      );
       // Clean up the recheck sub after 10s regardless
       setTimeout(() => unsub(), 10_000);
     };
