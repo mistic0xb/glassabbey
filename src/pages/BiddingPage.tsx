@@ -300,15 +300,7 @@ const BiddingPage = () => {
         <div className="flex flex-col gap-4">
           {/* Bid increment picker */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-1">Bid Amount</p>
-            <p className="text-white/40 text-xs mb-4">
-              Current highest:{" "}
-              <span className="text-white/60">
-                {currentHighestBid > 0
-                  ? `${currentHighestBid.toLocaleString()} sats`
-                  : "no bids yet"}
-              </span>
-            </p>
+            <p className="text-white font-semibold text-sm mb-4">Bid Amount</p>
             <div className="flex flex-wrap gap-2">
               {BID_PRESETS.map((amt) => {
                 return (
