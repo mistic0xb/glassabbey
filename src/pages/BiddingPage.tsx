@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { flushSync } from "react-dom";
 import { useNavigate, useParams } from "react-router";
 import {
   uniqueNamesGenerator,
@@ -8,6 +9,7 @@ import {
 } from "unique-names-generator";
 import { generateSecretKey, getPublicKey } from "nostr-tools";
 import { fetchBidsForPiece, type Bid } from "../libs/nostr/bid";
+import { monitorZapPayment } from "../libs/nostr/nip57";
 import { fetchPieceById } from "../libs/nostr/pieces";
 import { fetchAllCollections } from "../libs/nostr/collection";
 import type { Piece, Collection } from "../types/types";
@@ -98,14 +100,14 @@ const BiddingPage = () => {
   }, [id]);
 
   // Fetch bids
-  const fetchBids = () => {
+  const fetchBids = useCallback(() => {
     if (!id) return;
     setLoadingBids(true);
     fetchBidsForPiece(id).then((fetched) => {
       setBids(fetched);
       setLoadingBids(false);
     });
-  };
+  }, [id]);
 
   useEffect(() => {
     fetchBids();
@@ -116,6 +118,17 @@ const BiddingPage = () => {
     window.addEventListener("focus", fetchBids);
     return () => window.removeEventListener("focus", fetchBids);
   }, [id]);
+
+  // Live-update: re-fetch bids whenever a new zap lands for this piece
+  useEffect(() => {
+    if (!id || !piece) return;
+    const unsubscribe = monitorZapPayment(piece.id, piece.creatorPubkey, () => {
+      flushSync(() => {
+        fetchBids();
+      });
+    });
+    return () => unsubscribe();
+  }, [id, piece]);
 
   // Sort bids by bidAmt descending
   const sortedBids = useMemo(
@@ -149,6 +162,7 @@ const BiddingPage = () => {
   );
 
   // Price per bid = willingAmt - submitAmt (used in bid list rows)
+  // For the stat card, show the top bidder's price
   const totalSubmit = useMemo(
     () => bids.reduce((acc, b) => acc + b.submitAmt, 0),
     [bids],
