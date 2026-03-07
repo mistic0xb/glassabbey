@@ -125,23 +125,23 @@ const BiddingPage = () => {
 
   const topBidder = sortedBids[0] ?? null;
 
-  // Value = sum of all (bidAmt + submitAmt)
-  const value = useMemo(
-    () => bids.reduce((acc, b) => acc + b.willingAmt + b.submitAmt, 0),
-    [bids],
-  );
-
-  // Price = sum of all (bidAmt - submitAmt)
-  const price = useMemo(
-    () => bids.reduce((acc, b) => acc + b.willingAmt - b.submitAmt, 0),
-    [bids],
-  );
-
-  // Current highest bidAmt — new bid will be added on top of this
+  // Current highest willingAmt across all bids
   const currentHighestBid = useMemo(
     () => Math.max(0, ...bids.map((b) => b.willingAmt)),
     [bids],
   );
+
+  // Value = highest bid + sum of all submitAmts
+  const value = useMemo(
+    () => currentHighestBid + bids.reduce((acc, b) => acc + b.submitAmt, 0),
+    [bids, currentHighestBid],
+  );
+
+  // Price per bid = willingAmt - submitAmt (used in bid list rows)
+  // For the stat card, show the top bidder's price
+  const topBidPrice = topBidder
+    ? topBidder.willingAmt - topBidder.submitAmt
+    : 0;
 
   const handleBidAmtSelect = (amt: number) => {
     setBidAmt(amt);
@@ -252,7 +252,7 @@ const BiddingPage = () => {
                 </p>
               </div>
               <p className="text-yellow-400 font-bold text-lg">
-                {topBidder.willingAmt.toLocaleString()} sats
+                {(topBidder.willingAmt - topBidder.submitAmt).toLocaleString()} sats
               </p>
             </div>
           )}
@@ -260,8 +260,8 @@ const BiddingPage = () => {
           {/* Value & Price */}
           <div className="grid grid-cols-2 gap-3">
             {[
-              { label: "Value", val: value, hint: "Σ(bid + submit)" },
-              { label: "Price", val: price, hint: "Σ(bid − submit)" },
+              { label: "Value", val: value, hint: "top bid + Σ(submit)" },
+              { label: "Price", val: topBidPrice, hint: "top bid − top submit" },
             ].map(({ label, val, hint }) => (
               <div
                 key={label}
@@ -383,7 +383,7 @@ const BiddingPage = () => {
                     <span
                       className={`font-semibold text-xs whitespace-nowrap ${i === 0 ? "text-green-400" : "text-white/60"}`}
                     >
-                      {bid.willingAmt.toLocaleString()} sats
+                      {(bid.willingAmt - bid.submitAmt).toLocaleString()} sats
                     </span>
                   </div>
                 ))}
