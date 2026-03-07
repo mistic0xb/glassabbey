@@ -21,7 +21,7 @@ const App = () => {
       <AuthProvider>
         <Navbar />
         <main className="min-h-screen bg-[url('/bg.webp')] bg-cover bg-center bg-fixed">
-          <div className="min-h-screen bg-black/70 backdrop-blur-sm">
+          <div className="min-h-screen bg-black/80 backdrop-blur-sm">
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/explore" element={<Explore />} />
