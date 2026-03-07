@@ -125,6 +125,17 @@ const BiddingPage = () => {
 
   const topBidder = sortedBids[0] ?? null;
 
+  // Compute running price for each bid = willingAmt - sum of all submitAmts up to that bid
+  const bidsWithPrice = useMemo(() => {
+    const ascending = [...sortedBids].reverse();
+    let cumSubmit = 0;
+    const withPrice = ascending.map((bid) => {
+      cumSubmit += bid.submitAmt;
+      return { ...bid, runningPrice: bid.willingAmt - cumSubmit };
+    });
+    return withPrice.reverse(); // back to descending
+  }, [sortedBids]);
+
   // Current highest willingAmt across all bids
   const currentHighestBid = useMemo(
     () => Math.max(0, ...bids.map((b) => b.willingAmt)),
@@ -138,10 +149,12 @@ const BiddingPage = () => {
   );
 
   // Price per bid = willingAmt - submitAmt (used in bid list rows)
-  // For the stat card, show the top bidder's price
-  const topBidPrice = topBidder
-    ? topBidder.willingAmt - topBidder.submitAmt
-    : 0;
+  const totalSubmit = useMemo(
+    () => bids.reduce((acc, b) => acc + b.submitAmt, 0),
+    [bids],
+  );
+
+  const topBidPrice = topBidder ? topBidder.willingAmt - totalSubmit : 0;
 
   const handleBidAmtSelect = (amt: number) => {
     setBidAmt(amt);
@@ -180,8 +193,8 @@ const BiddingPage = () => {
     if (submitting) return "…";
     if (!bidAmt && !submitAmt) return "Select both amounts to bid";
     if (!bidAmt) return "Select a bid increment";
-    if (!submitAmt) return "Select a submit amount";
-    return `Bid ${formatSats(finalBidAmt!)} sats →`;
+    if (!submitAmt) return "Select a deposit amount";
+    return `Bid`;
   };
 
   if (loadingPiece) {
@@ -252,7 +265,7 @@ const BiddingPage = () => {
                 </p>
               </div>
               <p className="text-yellow-400 font-bold text-lg">
-                {(topBidder.willingAmt - topBidder.submitAmt).toLocaleString()} sats
+                {topBidPrice.toLocaleString()} sats
               </p>
             </div>
           )}
@@ -261,7 +274,11 @@ const BiddingPage = () => {
           <div className="grid grid-cols-2 gap-3">
             {[
               { label: "Value", val: value, hint: "top bid + Σ(submit)" },
-              { label: "Price", val: topBidPrice, hint: "top bid − top submit" },
+              {
+                label: "Price",
+                val: topBidPrice,
+                hint: "top bid − Σ(submit)",
+              },
             ].map(({ label, val, hint }) => (
               <div
                 key={label}
@@ -307,9 +324,9 @@ const BiddingPage = () => {
             </div>
           </div>
 
-          {/* Submit */}
+          {/* Deposit */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-1">Submit</p>
+            <p className="text-white font-semibold text-sm mb-1">Deposit</p>
             <p className="text-white/40 text-xs mb-4">
               Paid now via Lightning — deducted from final price
             </p>
@@ -363,7 +380,7 @@ const BiddingPage = () => {
               </p>
             ) : (
               <div className="flex flex-col gap-1.5 max-h-52 overflow-y-auto">
-                {sortedBids.map((bid, i) => (
+                {bidsWithPrice.map((bid, i) => (
                   <div
                     key={bid.id}
                     className={`grid grid-cols-[1.5rem_1fr_auto] items-center gap-3 px-3 py-2.5 rounded border text-sm ${
@@ -383,7 +400,7 @@ const BiddingPage = () => {
                     <span
                       className={`font-semibold text-xs whitespace-nowrap ${i === 0 ? "text-green-400" : "text-white/60"}`}
                     >
-                      {(bid.willingAmt - bid.submitAmt).toLocaleString()} sats
+                      {bid.runningPrice.toLocaleString()} sats
                     </span>
                   </div>
                 ))}
