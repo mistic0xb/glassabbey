@@ -207,7 +207,7 @@ const BiddingPage = () => {
     if (submitting) return "…";
     if (!bidAmt && !submitAmt) return "Select both amounts to bid";
     if (!bidAmt) return "Select a bid increment";
-    if (!submitAmt) return "Select a deposit amount";
+    if (!submitAmt) return "Select a submit amount";
     return `Bid`;
   };
 
@@ -330,9 +330,9 @@ const BiddingPage = () => {
             </div>
           </div>
 
-          {/* Deposit */}
+          {/* Submit */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-1">Deposit</p>
+            <p className="text-white font-semibold text-sm mb-1">Submit</p>
             <p className="text-white/40 text-xs mb-4">
               Paid now via Lightning — deducted from final price
             </p>
