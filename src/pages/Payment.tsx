@@ -16,23 +16,19 @@ interface PaymentState {
   bidderName: string;
 }
 
-const formatSats = (n: number): string =>
-  n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
-
 const Payment = () => {
   const navigate = useNavigate();
   const { state } = useLocation() as { state: PaymentState | null };
 
   const [invoice, setInvoice] = useState<string | null>(null);
+  const [zapRequestId, setZapRequestId] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<
     "idle" | "waiting" | "publishing" | "confirmed"
   >("idle");
-  const [zapRequestId, setZapRequestId] = useState<string | null>(null);
 
-  // Track whether we've already handled the payment to avoid double-publishing
   const handledRef = useRef(false);
 
   if (!state) {
@@ -95,35 +91,33 @@ const Payment = () => {
     generate();
   }, []);
 
-  // Monitor zap payment via nostr relay
+  // Primary monitor — scoped strictly to this invoice via zapRequestId
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
     const unsubscribe = monitorZapPayment(
       recipientPubkey,
-      zapRequestId, // required, not optional anymore
       handlePaymentConfirmed,
-      // no `since` override — defaults to now, won't catch old events
+      undefined,
+      zapRequestId,
     );
     return () => unsubscribe();
   }, [invoice, zapRequestId, status, handlePaymentConfirmed]);
 
-  // When user returns to the page (from wallet app), re-check for zap
+  // Recheck on focus/visibility — for mobile where WS drops in background
   useEffect(() => {
     if (status !== "waiting") return;
 
     const recheckOnFocus = () => {
       if (handledRef.current || !zapRequestId) return;
-      // Look back only 5 minutes — but zapRequestId match means
-      // only OUR invoice can trigger this, so old bids are safe
-      const since = Math.floor(Date.now() / 1000) - 5 * 60;
+      const since = Math.floor(Date.now() / 1000) - 10 * 60;
       const unsub = monitorZapPayment(
         recipientPubkey,
-        zapRequestId,
         () => {
           unsub();
           handlePaymentConfirmed();
         },
         since,
+        zapRequestId,
       );
       setTimeout(() => unsub(), 10_000);
     };
@@ -150,9 +144,6 @@ const Payment = () => {
 
   const handleOpenWallet = () => {
     if (!invoice) return;
-    // Use window.open instead of window.location.href so the page stays alive
-    // and can receive the payment confirmation when the user returns.
-    // This also triggers the OS app picker if multiple wallet apps are installed.
     window.open(`lightning:${invoice}`, "_blank");
   };
 
@@ -178,7 +169,7 @@ const Payment = () => {
             <span className="text-white/60">{bidderName}</span>
             <span className="text-white/20 mx-2">·</span>
             <span className="text-green-400 font-semibold">
-              {formatSats(submitAmt)} sats
+              {submitAmt.toLocaleString()} sats
             </span>
           </div>
         </div>
@@ -216,7 +207,6 @@ const Payment = () => {
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
-        {/* Header */}
         <div>
           <p className="text-white/30 text-xs uppercase tracking-widest mb-1">
             {collectionName}
@@ -229,15 +219,13 @@ const Payment = () => {
           </p>
         </div>
 
-        {/* Amount */}
         <div className="flex justify-between items-center bg-white/5 border border-white/10 rounded-lg px-4 py-3">
-          <span className="text-white/40 text-sm">Deposit amount</span>
+          <span className="text-white/40 text-sm">Submit amount</span>
           <span className="text-green-400 font-bold text-xl">
-            {formatSats(submitAmt)} sats
+            {submitAmt.toLocaleString()} sats
           </span>
         </div>
 
-        {/* QR */}
         {invoice && (
           <div className="flex flex-col items-center gap-3">
             <div className="bg-white p-3 rounded-lg">
@@ -260,12 +248,10 @@ const Payment = () => {
           </div>
         )}
 
-        {/* Waiting */}
         <p className="text-white/20 text-xs text-center animate-pulse">
           Waiting for payment…
         </p>
 
-        {/* Actions */}
         <div className="flex flex-col gap-2">
           <button
             onClick={handleOpenWallet}

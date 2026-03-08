@@ -10,7 +10,7 @@ export interface ZapResult {
 
 export async function generatePieceInvoice(params: {
   lightningAddress: string;
-  amount: number; // sats
+  amount: number;
   pieceId: string;
   recipientPubkey: string;
   bidderName: string;
@@ -23,14 +23,13 @@ export async function generatePieceInvoice(params: {
   const lnurlResponse = await fetch(lnurlUrl);
   if (!lnurlResponse.ok) throw new Error("Lightning address not found");
   const lnurlData = await lnurlResponse.json();
-  if (!lnurlData.allowsNostr || !lnurlData.nostrPubkey) {
+  if (!lnurlData.allowsNostr || !lnurlData.nostrPubkey)
     throw new Error("This lightning address does not support zaps");
-  }
 
   const senderPrivkey = generateSecretKey();
   const zapRequestTemplate: EventTemplate = makeZapRequest({
     pubkey: recipientPubkey,
-    amount: amount * 1000, // millisats
+    amount: amount * 1000,
     relays: DEFAULT_RELAYS,
     comment: `bid-${pieceId}`,
   });
@@ -57,9 +56,9 @@ export async function generatePieceInvoice(params: {
 
 export function monitorZapPayment(
   recipientPubkey: string,
-  zapRequestId: string,
   onConfirmed: () => void,
   since?: number,
+  zapRequestId?: string,
 ): () => void {
   const pool = getPool();
   const seenIds = new Set<string>();
@@ -80,11 +79,12 @@ export function monitorZapPayment(
           if (!descTag?.[1]) return;
           const zapRequest = JSON.parse(descTag[1]);
 
-          // Only fire for our specific invoice — never skip this check
-          if (zapRequest.id !== zapRequestId) return;
+          // If scoped to a specific invoice, only fire for that one
+          if (zapRequestId && zapRequest.id !== zapRequestId) return;
 
           onConfirmed();
-          sub.close();
+          // Only close sub if watching a specific invoice — keep alive for "watch all"
+          if (zapRequestId) sub.close();
         } catch (err) {
           console.error("Failed to parse zap receipt:", err);
         }
@@ -92,7 +92,7 @@ export function monitorZapPayment(
     }
   );
 
-  const timeout = setTimeout(() => sub.close(), 600000); // 10 min timeout
+  const timeout = setTimeout(() => sub.close(), 600000);
   return () => {
     clearTimeout(timeout);
     sub.close();
