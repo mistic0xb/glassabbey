@@ -30,6 +30,7 @@ const Payment = () => {
   const [status, setStatus] = useState<
     "idle" | "waiting" | "publishing" | "confirmed"
   >("idle");
+  const [zapRequestId, setZapRequestId] = useState<string | null>(null);
 
   // Track whether we've already handled the payment to avoid double-publishing
   const handledRef = useRef(false);
@@ -81,6 +82,7 @@ const Payment = () => {
           bidderName,
         });
         setInvoice(result.invoice);
+        setZapRequestId(result.zapRequestId);
         setStatus("waiting");
       } catch (err) {
         setError(
@@ -95,39 +97,37 @@ const Payment = () => {
 
   // Monitor zap payment via nostr relay
   useEffect(() => {
-    if (!invoice || status !== "waiting") return;
+    if (!invoice || !zapRequestId || status !== "waiting") return;
     const unsubscribe = monitorZapPayment(
-      piece.id,
       recipientPubkey,
+      zapRequestId, // required, not optional anymore
       handlePaymentConfirmed,
+      // no `since` override — defaults to now, won't catch old events
     );
     return () => unsubscribe();
-  }, [invoice, status, handlePaymentConfirmed]);
+  }, [invoice, zapRequestId, status, handlePaymentConfirmed]);
 
   // When user returns to the page (from wallet app), re-check for zap
-  // The monitor may have missed the event while the page was backgrounded
   useEffect(() => {
     if (status !== "waiting") return;
 
     const recheckOnFocus = () => {
-      if (handledRef.current) return;
-      // Use a since timestamp 3 mins in the past to catch zaps that landed
-      // while the page was backgrounded (WebSocket was suspended by the mobile OS)
-      const sinceTenMinsAgo = Math.floor(Date.now() / 1000) - 3 * 60;
+      if (handledRef.current || !zapRequestId) return;
+      // Look back only 5 minutes — but zapRequestId match means
+      // only OUR invoice can trigger this, so old bids are safe
+      const since = Math.floor(Date.now() / 1000) - 5 * 60;
       const unsub = monitorZapPayment(
-        piece.id,
         recipientPubkey,
+        zapRequestId,
         () => {
           unsub();
           handlePaymentConfirmed();
         },
-        sinceTenMinsAgo,
+        since,
       );
-      // Clean up the recheck sub after 10s regardless
       setTimeout(() => unsub(), 10_000);
     };
 
-    // visibilitychange fires on mobile when returning from another app
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") recheckOnFocus();
     };
@@ -139,7 +139,7 @@ const Payment = () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("focus", recheckOnFocus);
     };
-  }, [status, piece.id, recipientPubkey, handlePaymentConfirmed]);
+  }, [status, zapRequestId, recipientPubkey, handlePaymentConfirmed]);
 
   const handleCopy = () => {
     if (!invoice) return;

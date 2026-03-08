@@ -23,7 +23,6 @@ export async function generatePieceInvoice(params: {
   const lnurlResponse = await fetch(lnurlUrl);
   if (!lnurlResponse.ok) throw new Error("Lightning address not found");
   const lnurlData = await lnurlResponse.json();
-
   if (!lnurlData.allowsNostr || !lnurlData.nostrPubkey) {
     throw new Error("This lightning address does not support zaps");
   }
@@ -35,7 +34,6 @@ export async function generatePieceInvoice(params: {
     relays: DEFAULT_RELAYS,
     comment: `bid-${pieceId}`,
   });
-
   zapRequestTemplate.tags.push(["piece", pieceId]);
   zapRequestTemplate.tags.push(["bidderName", bidderName]);
   zapRequestTemplate.content = `bid-${pieceId}`;
@@ -58,10 +56,10 @@ export async function generatePieceInvoice(params: {
 }
 
 export function monitorZapPayment(
-  pieceId: string,
   recipientPubkey: string,
+  zapRequestId: string,
   onConfirmed: () => void,
-  since?: number, // optional: unix timestamp to look back from (for recheck after backgrounding)
+  since?: number,
 ): () => void {
   const pool = getPool();
   const seenIds = new Set<string>();
@@ -81,11 +79,12 @@ export function monitorZapPayment(
           const descTag = event.tags.find((t) => t[0] === "description");
           if (!descTag?.[1]) return;
           const zapRequest = JSON.parse(descTag[1]);
-          const pieceTag = zapRequest.tags?.find((t: string[]) => t[0] === "piece");
-          if (pieceTag?.[1] === pieceId) {
-            onConfirmed();
-            sub.close();
-          }
+
+          // Only fire for our specific invoice — never skip this check
+          if (zapRequest.id !== zapRequestId) return;
+
+          onConfirmed();
+          sub.close();
         } catch (err) {
           console.error("Failed to parse zap receipt:", err);
         }
