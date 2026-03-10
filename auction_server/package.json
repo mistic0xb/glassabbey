@@ -1,0 +1,17 @@
+{
+  "name": "auction-server",
+  "version": "1.0.0",
+  "description": "WebSocket bid sequencer for nostr auction house",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "bun --watch server.ts",
+    "start": "bun server.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/ws": "^8.5.10"
+  }
+}

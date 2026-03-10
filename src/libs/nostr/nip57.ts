@@ -56,9 +56,9 @@ export async function generatePieceInvoice(params: {
 
 export function monitorZapPayment(
   recipientPubkey: string,
+  zapRequestId: string,
   onConfirmed: () => void,
   since?: number,
-  zapRequestId?: string,
 ): () => void {
   const pool = getPool();
   const seenIds = new Set<string>();

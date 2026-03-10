@@ -1,5 +1,4 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
-import { flushSync } from "react-dom";
 import { useNavigate, useParams } from "react-router";
 import {
   uniqueNamesGenerator,
@@ -9,9 +8,9 @@ import {
 } from "unique-names-generator";
 import { generateSecretKey, getPublicKey } from "nostr-tools";
 import { fetchBidsForPiece, type Bid } from "../libs/nostr/bid";
-import { monitorZapPayment } from "../libs/nostr/nip57";
 import { fetchPieceById } from "../libs/nostr/pieces";
 import { fetchAllCollections } from "../libs/nostr/collection";
+import { useAuction } from "../libs/useAuction";
 import type { Piece, Collection } from "../types/types";
 
 const getBidderName = (pubkey: string): string =>
@@ -67,7 +66,6 @@ const BiddingPage = () => {
   const [loadingBids, setLoadingBids] = useState(true);
   const [bidAmt, setBidAmt] = useState<number | null>(null);
   const [submitAmt, setSubmitAmt] = useState<number | null>(null);
-  const [submitting, setSubmitting] = useState(false);
   const [bidderName, setBidderName] = useState("");
 
   const [myPubkey] = useState(() => getPublicKey(generateSecretKey()));
@@ -75,22 +73,21 @@ const BiddingPage = () => {
   const displayName =
     bidderName.trim() !== "" ? bidderName.trim().toLowerCase() : fallbackName;
 
+  // Auction server — source of truth for currentHighestBid and lock state
+  const { state: auction, submitBid } = useAuction(id ?? "");
+  const currentHighestBid = auction.currentHighestBid;
+
   // Fetch piece + collection
   useEffect(() => {
     if (!id) return;
     const load = async () => {
       setLoadingPiece(true);
       const fetchedPiece = await fetchPieceById(id);
-      if (!fetchedPiece) {
-        navigate(-1);
-        return;
-      }
+      if (!fetchedPiece) { navigate(-1); return; }
       setPiece(fetchedPiece);
       const allCollections = await fetchAllCollections(200);
       const match = allCollections.find(
-        (c) =>
-          c.id === fetchedPiece.collectionId &&
-          c.pubkey === fetchedPiece.creatorPubkey,
+        (c) => c.id === fetchedPiece.collectionId && c.pubkey === fetchedPiece.creatorPubkey,
       );
       setCollection(match ?? null);
       setLoadingPiece(false);
@@ -98,7 +95,7 @@ const BiddingPage = () => {
     load();
   }, [id]);
 
-  // Fetch bids
+  // Fetch bids from nostr (display only)
   const fetchBids = useCallback(() => {
     if (!id) return;
     setLoadingBids(true);
@@ -108,28 +105,38 @@ const BiddingPage = () => {
     });
   }, [id]);
 
-  useEffect(() => {
-    fetchBids();
-  }, [fetchBids]);
+  useEffect(() => { fetchBids(); }, [fetchBids]);
 
-  // Refetch bids on window focus (after returning from payment)
   useEffect(() => {
     window.addEventListener("focus", fetchBids);
     return () => window.removeEventListener("focus", fetchBids);
   }, [fetchBids]);
 
-  // Live-update: watch ALL zaps for this piece's recipient — no zapRequestId
+  // Refetch nostr bids whenever server confirms a new bid
   useEffect(() => {
-    if (!piece) return;
-    const unsubscribe = monitorZapPayment(piece.creatorPubkey, () => {
-      flushSync(() => {
-        fetchBids();
-      });
-    });
-    return () => unsubscribe();
-  }, [piece, fetchBids]);
+    if (auction.status === "idle" && auction.currentHighestBid > 0) {
+      fetchBids();
+    }
+  }, [auction.currentHighestBid]);
 
-  // Sort bids by bidAmt descending
+  // Navigate to payment when server grants the bid slot
+  useEffect(() => {
+    if (auction.status !== "won" || !auction.wonDetails || !piece || !collection) return;
+    const { finalBidAmt, submitAmt: wonSubmitAmt, bidderName: wonBidderName } = auction.wonDetails;
+    const slug = piece.artifactName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+    navigate(`/payment/${slug}/${piece.id}`, {
+      state: {
+        piece,
+        collectionName: collection.name,
+        lightningAddress: collection.lightningAddress,
+        recipientPubkey: collection.pubkey,
+        willingAmt: finalBidAmt,
+        submitAmt: wonSubmitAmt,
+        bidderName: wonBidderName,
+      },
+    });
+  }, [auction.status, auction.wonDetails, piece, collection]);
+
   const sortedBids = useMemo(
     () => [...bids].sort((a, b) => b.willingAmt - a.willingAmt),
     [bids],
@@ -140,69 +147,47 @@ const BiddingPage = () => {
   const bidsWithPrice = useMemo(() => {
     const ascending = [...sortedBids].reverse();
     let cumSubmit = 0;
-    const withPrice = ascending.map((bid) => {
+    return ascending.map((bid) => {
       cumSubmit += bid.submitAmt;
       return { ...bid, runningPrice: bid.willingAmt - cumSubmit };
-    });
-    return withPrice.reverse();
+    }).reverse();
   }, [sortedBids]);
-
-  const currentHighestBid = useMemo(
-    () => Math.max(0, ...bids.map((b) => b.willingAmt)),
-    [bids],
-  );
-
-  const value = useMemo(
-    () => currentHighestBid + bids.reduce((acc, b) => acc + b.submitAmt, 0),
-    [bids, currentHighestBid],
-  );
 
   const totalSubmit = useMemo(
     () => bids.reduce((acc, b) => acc + b.submitAmt, 0),
     [bids],
   );
 
+  const value = currentHighestBid + totalSubmit;
   const topBidPrice = topBidder ? topBidder.willingAmt - totalSubmit : 0;
+  const finalBidAmt = bidAmt !== null ? currentHighestBid + bidAmt : null;
 
   const handleBidAmtSelect = (amt: number) => {
     setBidAmt(amt);
-    const newFinalBidAmt = currentHighestBid + amt;
-    if (submitAmt !== null && submitAmt > newFinalBidAmt) {
-      setSubmitAmt(null);
-    }
+    const newFinal = currentHighestBid + amt;
+    if (submitAmt !== null && submitAmt > newFinal) setSubmitAmt(null);
   };
 
-  const finalBidAmt = bidAmt !== null ? currentHighestBid + bidAmt : null;
+  const isLocked =
+    auction.status === "locked" ||
+    auction.status === "won" ||
+    auction.status === "connecting";
 
-  const canSubmit =
-    !!finalBidAmt && !!submitAmt && !submitting && !!piece && !!collection;
+  const canSubmit = !!finalBidAmt && !!submitAmt && !isLocked && !!piece && !!collection;
 
   const handleSubmitBid = () => {
-    if (!canSubmit || !piece || !collection || finalBidAmt === null) return;
-    setSubmitting(true);
-    const slug = piece.artifactName
-      .toLowerCase()
-      .replace(/\s+/g, "-")
-      .replace(/[^a-z0-9-]/g, "");
-    navigate(`/payment/${slug}/${piece.id}`, {
-      state: {
-        piece,
-        collectionName: collection.name,
-        lightningAddress: collection.lightningAddress,
-        recipientPubkey: collection.pubkey,
-        willingAmt: finalBidAmt,
-        submitAmt,
-        bidderName: displayName,
-      },
-    });
+    if (!canSubmit || bidAmt === null || submitAmt === null) return;
+    submitBid(displayName, bidAmt, submitAmt);
   };
 
   const submitLabel = () => {
-    if (submitting) return "…";
+    if (auction.status === "connecting") return "Connecting…";
+    if (auction.status === "won") return "Proceeding to payment…";
+    if (auction.status === "locked") return "Waiting — someone is paying…";
     if (!bidAmt && !submitAmt) return "Select both amounts to bid";
     if (!bidAmt) return "Select a bid increment";
-    if (!submitAmt) return "Select a submit amount";
-    return "Bid";
+    if (!submitAmt) return "Select a deposit amount";
+    return `Bid ${formatSats(finalBidAmt!)} sats →`;
   };
 
   if (loadingPiece) {
@@ -230,65 +215,47 @@ const BiddingPage = () => {
           <div className="rounded-lg overflow-hidden border border-white/10">
             <div className="h-64 sm:h-72 overflow-hidden">
               <img
-                src={
-                  piece.imageUrl ||
-                  "https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?w=600&h=400&fit=crop"
-                }
+                src={piece.imageUrl || "https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?w=600&h=400&fit=crop"}
                 alt={piece.artifactName}
                 className="w-full h-full object-cover"
               />
             </div>
             <div className="p-5 flex flex-col gap-2 border-t border-white/10">
-              <p className="text-white/30 text-xs uppercase tracking-widest">
-                {collection?.name}
-              </p>
+              <p className="text-white/30 text-xs uppercase tracking-widest">{collection?.name}</p>
               <div className="border-t border-white/10 pt-3">
-                <h1 className="text-white font-semibold text-xl">
-                  {piece.artifactName}
-                </h1>
-                <p className="text-white/50 text-sm italic mt-1">
-                  by {piece.makerName}
-                </p>
+                <h1 className="text-white font-semibold text-xl">{piece.artifactName}</h1>
+                <p className="text-white/50 text-sm italic mt-1">by {piece.makerName}</p>
               </div>
               {piece.size && (
                 <div className="border-t border-white/10 pt-3 flex justify-between items-center">
-                  <span className="text-white/30 text-xs uppercase tracking-widest">
-                    Size
-                  </span>
+                  <span className="text-white/30 text-xs uppercase tracking-widest">Size</span>
                   <span className="text-white/70 text-sm">{piece.size}</span>
                 </div>
               )}
             </div>
           </div>
 
+          {/* Top bidder */}
           {topBidder && (
             <div className="border border-yellow-500/20 bg-yellow-500/5 rounded-lg px-4 py-3 flex justify-between items-center">
               <div>
-                <p className="text-white/30 text-xs uppercase tracking-widest mb-0.5">
-                  Top Bidder
-                </p>
+                <p className="text-white/30 text-xs uppercase tracking-widest mb-0.5">Top Bidder</p>
                 <p className="text-white/80 text-sm font-medium">
                   {topBidder.bidderName || getBidderName(topBidder.pubkey)}
                 </p>
               </div>
-              <p className="text-yellow-400 font-bold text-lg">
-                {topBidPrice.toLocaleString()} sats
-              </p>
+              <p className="text-yellow-400 font-bold text-lg">{topBidPrice.toLocaleString()} sats</p>
             </div>
           )}
 
+          {/* Value & Price */}
           <div className="grid grid-cols-2 gap-3">
             {[
               { label: "Value", val: value, hint: "top bid + Σ(submit)" },
               { label: "Price", val: topBidPrice, hint: "top bid − Σ(submit)" },
             ].map(({ label, val, hint }) => (
-              <div
-                key={label}
-                className="border border-white/10 rounded-lg p-4 bg-white/2"
-              >
-                <p className="text-white/30 text-xs uppercase tracking-widest mb-2">
-                  {label}
-                </p>
+              <div key={label} className="border border-white/10 rounded-lg p-4 bg-white/2">
+                <p className="text-white/30 text-xs uppercase tracking-widest mb-2">{label}</p>
                 <p className="text-yellow-400 font-bold text-xl">
                   {val > 0 ? `${val.toLocaleString()} sats` : "—"}
                 </p>
@@ -300,31 +267,57 @@ const BiddingPage = () => {
 
         {/* RIGHT */}
         <div className="flex flex-col gap-4">
+
+          {/* Server error banner */}
+          {auction.status === "error" && (
+            <div className="border border-red-500/20 bg-red-500/5 rounded-lg px-4 py-3">
+              <p className="text-red-400 text-xs">
+                {auction.errorMsg ?? "Cannot connect to auction server"}
+              </p>
+            </div>
+          )}
+
+          {/* Locked banner */}
+          {auction.status === "locked" && (
+            <div className="border border-yellow-500/20 bg-yellow-500/5 rounded-lg px-4 py-3">
+              <p className="text-yellow-400 text-xs animate-pulse">
+                Someone is completing a payment — please wait…
+              </p>
+            </div>
+          )}
+
+          {/* Bid increment picker */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-4">Bid Amount</p>
+            <p className="text-white font-semibold text-sm mb-1">Bid Amount</p>
+            <p className="text-white/40 text-xs mb-4">
+              Current highest:{" "}
+              <span className="text-white/60">
+                {currentHighestBid > 0 ? `${currentHighestBid.toLocaleString()} sats` : "no bids yet"}
+              </span>
+            </p>
             <div className="flex flex-wrap gap-2">
               {BID_PRESETS.map((amt) => (
                 <PresetBtn
                   key={amt}
                   value={amt}
-                  label={`+${formatSats(amt)}`}
+                  label={`+${formatSats(amt)} → ${formatSats(currentHighestBid + amt)}`}
                   selected={bidAmt}
                   onSelect={handleBidAmtSelect}
+                  disabled={isLocked}
                 />
               ))}
             </div>
           </div>
 
+          {/* Deposit */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-1">
-              Submit Amount
-            </p>
+            <p className="text-white font-semibold text-sm mb-1">Deposit</p>
             <p className="text-white/40 text-xs mb-4">
               Paid now via Lightning — deducted from final price
             </p>
             <div className="flex flex-wrap gap-2">
               {SUBMIT_PRESETS.map((amt) => {
-                const isDisabled = finalBidAmt !== null && amt > finalBidAmt;
+                const isDisabled = isLocked || (finalBidAmt !== null && amt > finalBidAmt);
                 return (
                   <PresetBtn
                     key={amt}
@@ -339,6 +332,7 @@ const BiddingPage = () => {
             </div>
           </div>
 
+          {/* Bidder name */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
             <p className="text-white font-semibold text-sm mb-1">Bidder Name</p>
             <input
@@ -352,43 +346,34 @@ const BiddingPage = () => {
             </p>
           </div>
 
+          {/* Bid list */}
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
             <div className="flex justify-between items-center mb-4">
               <p className="text-white font-semibold text-sm">All Bids</p>
               {!loadingBids && bids.length > 0 && (
-                <span className="text-white/30 text-xs">
-                  {bids.length} total
-                </span>
+                <span className="text-white/30 text-xs">{bids.length} total</span>
               )}
             </div>
             {loadingBids ? (
               <p className="text-white/30 text-sm py-2">Loading bids…</p>
             ) : sortedBids.length === 0 ? (
-              <p className="text-white/20 text-sm text-center py-4">
-                No bids yet. Be the first.
-              </p>
+              <p className="text-white/20 text-sm text-center py-4">No bids yet. Be the first.</p>
             ) : (
               <div className="flex flex-col gap-1.5 max-h-52 overflow-y-auto">
                 {bidsWithPrice.map((bid, i) => (
                   <div
                     key={bid.id}
                     className={`grid grid-cols-[1.5rem_1fr_auto] items-center gap-3 px-3 py-2.5 rounded border text-sm ${
-                      i === 0
-                        ? "border-green-500/20 bg-green-500/5"
-                        : "border-white/5 bg-white/1"
+                      i === 0 ? "border-green-500/20 bg-green-500/5" : "border-white/5 bg-white/1"
                     }`}
                   >
-                    <span
-                      className={`text-xs font-semibold ${i === 0 ? "text-green-400" : "text-white/20"}`}
-                    >
+                    <span className={`text-xs font-semibold ${i === 0 ? "text-green-400" : "text-white/20"}`}>
                       #{i + 1}
                     </span>
                     <span className="text-white/50 truncate text-xs">
                       {bid.bidderName || getBidderName(bid.pubkey)}
                     </span>
-                    <span
-                      className={`font-semibold text-xs whitespace-nowrap ${i === 0 ? "text-green-400" : "text-white/60"}`}
-                    >
+                    <span className={`font-semibold text-xs whitespace-nowrap ${i === 0 ? "text-green-400" : "text-white/60"}`}>
                       {bid.runningPrice.toLocaleString()} sats
                     </span>
                   </div>
