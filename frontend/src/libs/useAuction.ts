@@ -24,11 +24,11 @@ const DEFAULT_STATE: AuctionState = {
   errorMsg: null,
 };
 
-// --- Singleton registry: one WS + shared state per pieceId ---
 interface Entry {
   ws: WebSocket;
   state: AuctionState;
   listeners: Set<(s: AuctionState) => void>;
+  intentionalClose: boolean; // true = cancel/confirm, don't set error status
 }
 
 const registry = new Map<string, Entry>();
@@ -40,6 +40,7 @@ function getOrCreate(pieceId: string): Entry {
     ws: null!,
     state: { ...DEFAULT_STATE },
     listeners: new Set(),
+    intentionalClose: false,
   };
 
   const notify = (update: Partial<AuctionState>) => {
@@ -59,19 +60,12 @@ function getOrCreate(pieceId: string): Entry {
 
     switch (msg.type) {
       case "STATE":
-        notify({
-          currentHighestBid: msg.currentPrice,
-          status: msg.locked ? "locked" : "idle",
-        });
+        notify({ currentHighestBid: msg.currentPrice, status: msg.locked ? "locked" : "idle" });
         break;
       case "BID_WON":
         notify({
           status: "won",
-          wonDetails: {
-            finalBidAmt: msg.willingAmt,  // willingAmt = currentPrice + bidAmt, stored on nostr
-            submitAmt: msg.submitAmt,
-            bidderName: msg.bidderName,
-          },
+          wonDetails: { finalBidAmt: msg.willingAmt, submitAmt: msg.submitAmt, bidderName: msg.bidderName },
         });
         break;
       case "BID_QUEUED":
@@ -87,12 +81,7 @@ function getOrCreate(pieceId: string): Entry {
         notify({ status: "idle", errorMsg: null });
         break;
       case "NEW_BID":
-        notify({
-          status: "idle",
-          currentHighestBid: msg.currentPrice,
-          wonDetails: null,
-          errorMsg: null,
-        });
+        notify({ status: "idle", currentHighestBid: msg.currentPrice, wonDetails: null, errorMsg: null });
         break;
       case "ERROR":
         notify({ errorMsg: msg.reason });
@@ -101,18 +90,25 @@ function getOrCreate(pieceId: string): Entry {
   };
 
   ws.onclose = () => {
-    notify({ status: "error", errorMsg: "Disconnected from auction server" });
     registry.delete(pieceId);
+    // Only show error if this was unexpected (not cancel/confirm)
+    if (!entry.intentionalClose) {
+      notify({ status: "error", errorMsg: "Disconnected from auction server" });
+    } else {
+      // Reset to idle so BiddingPage re-enables the button
+      notify({ status: "idle", errorMsg: null, wonDetails: null });
+    }
   };
 
   ws.onerror = () => {
-    notify({ status: "error", errorMsg: "Connection error" });
+    if (!entry.intentionalClose) {
+      notify({ status: "error", errorMsg: "Connection error" });
+    }
   };
 
   return entry;
 }
 
-// --- Hook ---
 export function useAuction(pieceId: string) {
   const entry = getOrCreate(pieceId);
   const [state, setState] = useState<AuctionState>(entry.state);
@@ -121,34 +117,37 @@ export function useAuction(pieceId: string) {
 
   useEffect(() => {
     const e = entryRef.current;
-    // Sync in case state changed between render and effect
     setState(e.state);
     e.listeners.add(setState);
     return () => {
       e.listeners.delete(setState);
-      // Don't close the WS here — let it live for the next component
     };
   }, [pieceId]);
+
+  // Re-sync entry ref if pieceId causes a new entry to be created
+  useEffect(() => {
+    entryRef.current = getOrCreate(pieceId);
+  });
 
   const submitBid = useCallback((bidderName: string, bidAmt: number, submitAmt: number) => {
     entryRef.current.ws.send(JSON.stringify({ type: "SUBMIT_BID", bidderName, bidAmt, submitAmt }));
   }, []);
 
   const cancelBid = useCallback(() => {
-    entryRef.current.ws.send(JSON.stringify({ type: "CANCEL_BID" }));
-    // After cancelling, clean up the singleton so a fresh WS is made next time
     const e = registry.get(pieceId);
     if (e) {
+      e.intentionalClose = true;
+      e.ws.send(JSON.stringify({ type: "CANCEL_BID" }));
       e.ws.close();
       registry.delete(pieceId);
     }
   }, [pieceId]);
 
   const confirmZap = useCallback(() => {
-    entryRef.current.ws.send(JSON.stringify({ type: "ZAP_CONFIRMED" }));
-    // After confirming, clean up — bid is done
     const e = registry.get(pieceId);
     if (e) {
+      e.intentionalClose = true;
+      e.ws.send(JSON.stringify({ type: "ZAP_CONFIRMED" }));
       e.ws.close();
       registry.delete(pieceId);
     }
