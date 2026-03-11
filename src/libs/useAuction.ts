@@ -60,7 +60,7 @@ function getOrCreate(pieceId: string): Entry {
     switch (msg.type) {
       case "STATE":
         notify({
-          currentHighestBid: msg.currentHighestBid,
+          currentHighestBid: msg.currentPrice,
           status: msg.locked ? "locked" : "idle",
         });
         break;
@@ -68,7 +68,7 @@ function getOrCreate(pieceId: string): Entry {
         notify({
           status: "won",
           wonDetails: {
-            finalBidAmt: msg.finalBidAmt,
+            finalBidAmt: msg.willingAmt,  // willingAmt = currentPrice + bidAmt, stored on nostr
             submitAmt: msg.submitAmt,
             bidderName: msg.bidderName,
           },
@@ -89,7 +89,7 @@ function getOrCreate(pieceId: string): Entry {
       case "NEW_BID":
         notify({
           status: "idle",
-          currentHighestBid: msg.finalBidAmt,
+          currentHighestBid: msg.currentPrice,
           wonDetails: null,
           errorMsg: null,
         });
