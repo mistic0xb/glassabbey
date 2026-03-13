@@ -30,6 +30,7 @@ const emptyPiece = () => ({
   makerName: "",
   artifactName: "",
   size: "",
+  description: "",
   imageUrl: "",
   imageMode: "url" as "url" | "upload",
   uploading: false,
@@ -48,7 +49,6 @@ const getPlaceholder = (id: string) =>
 
 const isValidUrl = (url: string) => /^https?:\/\/.+\..+/.test(url);
 
-// Field 
 const Field = ({
   label,
   value,
@@ -79,7 +79,33 @@ const Field = ({
   </div>
 );
 
-// Image Input (URL or Upload)
+const TextareaField = ({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) => (
+  <div className="flex flex-col gap-1">
+    <label className="text-xs text-white/40 uppercase tracking-widest">
+      {label}
+    </label>
+    <textarea
+      value={value}
+      placeholder={placeholder}
+      maxLength={520}
+      onChange={(e) => onChange(e.target.value)}
+      rows={3}
+      className="bg-white/5 border border-white/10 focus:border-white/30 outline-none text-white text-sm px-3 py-2 rounded transition-colors placeholder:text-white/20 resize-none"
+    />
+    <p className="text-white/20 text-xs text-right">{value.length}/520</p>
+  </div>
+);
+
 const ImageInput = ({
   value,
   onChange,
@@ -164,7 +190,6 @@ const ImageInput = ({
   );
 };
 
-// Piece preview card
 export const PieceCard = ({
   piece,
   collectionName,
@@ -200,11 +225,17 @@ export const PieceCard = ({
           <span className="text-white/70 text-sm">{piece.size}</span>
         </div>
       )}
+      {piece.description && (
+        <div className="border-t border-white/10 pt-3">
+          <p className="text-white/50 text-sm leading-relaxed">
+            {piece.description}
+          </p>
+        </div>
+      )}
     </div>
   </div>
 );
 
-// Edit Collection Modal
 const EditCollectionModal = ({
   collection,
   onSave,
@@ -297,9 +328,9 @@ const AddPieces = () => {
     null,
   );
   const [deletingId, setDeletingId] = useState<string | null>(null);
-
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deletingCollection, setDeletingCollection] = useState(false);
+  const [focusedPieceIdx, setFocusedPieceIdx] = useState(0);
 
   const rawCollection: CollectionState | null =
     state ??
@@ -340,6 +371,21 @@ const AddPieces = () => {
     navigate("/admin/collection/create");
     return null;
   }
+
+  const focused = pieces[focusedPieceIdx];
+  const livePreviewPiece: Piece | null =
+    focused && (focused.imageUrl || focused.makerName || focused.artifactName)
+      ? {
+          id: `preview-${focusedPieceIdx}`,
+          collectionId: collection.id,
+          creatorPubkey: userPubkey ?? "",
+          makerName: focused.makerName || "—",
+          artifactName: focused.artifactName || "—",
+          size: focused.size || undefined,
+          description: focused.description || undefined,
+          imageUrl: focused.imageUrl || undefined,
+        }
+      : null;
 
   const updatePiece = (i: number, field: string, value: string) =>
     setPieces((prev) =>
@@ -412,6 +458,7 @@ const AddPieces = () => {
       makerName: p.makerName.trim(),
       artifactName: p.artifactName.trim(),
       size: p.size.trim() || undefined,
+      description: p.description.trim() || undefined,
       imageUrl: p.imageUrl.trim(),
     }));
   };
@@ -490,7 +537,6 @@ const AddPieces = () => {
 
   return (
     <div className="min-h-screen px-6 py-10 max-w-6xl mx-auto">
-      {/* Back */}
       <button
         onClick={() => navigate("/admin/dashboard")}
         className="text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
@@ -498,7 +544,6 @@ const AddPieces = () => {
         ← Dashboard
       </button>
 
-      {/* Heading */}
       <div className="flex items-start justify-between gap-4 mb-8 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-white">{collection.name}</h1>
@@ -526,11 +571,9 @@ const AddPieces = () => {
         )}
       </div>
 
-      {/* Two-column layout */}
       <div className="grid grid-cols-1 lg:grid-cols-[3fr_2fr] gap-8 items-start">
         {/* LEFT */}
         <div className="flex flex-col gap-8">
-          {/* Add pieces form */}
           <div>
             <p className="text-xs text-white/40 uppercase tracking-widest mb-4">
               Add New Pieces
@@ -539,6 +582,7 @@ const AddPieces = () => {
               {pieces.map((piece, i) => (
                 <div
                   key={i}
+                  onClick={() => setFocusedPieceIdx(i)}
                   className="border border-white/10 rounded-lg p-5 flex flex-col gap-4 bg-white/2"
                 >
                   <div className="flex justify-between items-center">
@@ -592,6 +636,12 @@ const AddPieces = () => {
                       onUpload={(f) => handleUpload(i, f)}
                     />
                   </div>
+                  <TextareaField
+                    label="Description"
+                    value={piece.description}
+                    onChange={(v) => updatePiece(i, "description", v)}
+                    placeholder="A brief description of the piece…"
+                  />
                   {piece.error && (
                     <p className="text-red-400 text-xs">{piece.error}</p>
                   )}
@@ -606,7 +656,6 @@ const AddPieces = () => {
             </button>
           </div>
 
-          {/* Saved pieces list */}
           {loading ? (
             <p className="text-white/30 text-sm text-center py-8">
               Fetching pieces…
@@ -674,7 +723,6 @@ const AddPieces = () => {
             )
           )}
 
-          {/* Actions */}
           <div className="border-t border-white/10 pt-6 flex justify-between items-center gap-3 flex-wrap">
             {isDraft && (
               <button
@@ -711,7 +759,12 @@ const AddPieces = () => {
 
         {/* RIGHT — preview */}
         <div className="sticky top-6">
-          {selectedPiece ? (
+          {livePreviewPiece ? (
+            <PieceCard
+              piece={livePreviewPiece}
+              collectionName={collection.name}
+            />
+          ) : selectedPiece ? (
             <PieceCard piece={selectedPiece} collectionName={collection.name} />
           ) : (
             <div className="border border-dashed border-white/10 rounded-lg h-64 flex items-center justify-center">

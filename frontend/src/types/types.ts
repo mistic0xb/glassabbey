@@ -15,6 +15,7 @@ export interface Piece {
     makerName: string;
     artifactName: string;
     size?: string;
+    description?: string;
     imageUrl?: string;
 }
 
