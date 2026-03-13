@@ -217,15 +217,28 @@ const BiddingPage = () => {
         {/* LEFT */}
         <div className="flex flex-col gap-4">
           <div className="rounded-lg overflow-hidden border border-white/10">
-            <div className="h-64 sm:h-72 overflow-hidden">
-              <img
-                src={
-                  piece.imageUrl ||
-                  "https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?w=600&h=400&fit=crop"
-                }
-                alt={piece.artifactName}
-                className="w-full h-full object-cover"
-              />
+            <div className="rounded-lg overflow-hidden border border-white/10">
+              <div className="h-84 sm:h-96 relative">
+                {/* blurred background */}
+                <img
+                  src={
+                    piece.imageUrl ||
+                    "https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?w=600&h=400&fit=crop"
+                  }
+                  className="absolute inset-0 w-full h-full object-cover blur-xl scale-110 opacity-40"
+                  alt=""
+                />
+
+                {/* main image */}
+                <img
+                  src={
+                    piece.imageUrl ||
+                    "https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?w=600&h=400&fit=crop"
+                  }
+                  alt={piece.artifactName}
+                  className="relative w-full h-full object-contain"
+                />
+              </div>
             </div>
             <div className="p-5 flex flex-col gap-2 border-t border-white/10">
               <p className="text-white/30 text-xs uppercase tracking-widest">
