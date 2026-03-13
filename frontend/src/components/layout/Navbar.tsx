@@ -12,7 +12,7 @@ const Navbar = () => {
 
   return (
     <nav className="sticky top-0 z-50 flex items-center justify-between px-6 h-15 bg-[#080806] border-b border-white/10">
-      <Link to="/" className="text-yellow-400 font-bold text-base no-underline">
+      <Link to="/" className="text-white font-bold text-base no-underline">
         GlassAbbey
       </Link>
 
