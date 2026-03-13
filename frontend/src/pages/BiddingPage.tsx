@@ -23,8 +23,8 @@ const getBidderName = (pubkey: string): string =>
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
-const BID_PRESETS = [1000, 2000, 4000, 5000, 10000];
-const SUBMIT_PRESETS = [10, 21, 2000, 3000];
+const BID_PRESETS = [1000, 5000, 10000, 50000, 100000, 250000];
+const SUBMIT_PRESETS = [100];
 
 const PresetBtn = ({
   label,
@@ -201,7 +201,7 @@ const BiddingPage = () => {
     if (auction.status === "locked") return "Waiting — someone is paying…";
     if (!bidAmt && !submitAmt) return "Select both amounts to bid";
     if (!bidAmt) return "Select a bid increment";
-    if (!submitAmt) return "Select a deposit amount";
+    if (!submitAmt) return "Select a submit amount";
     return "Bid";
   };
 
@@ -261,23 +261,6 @@ const BiddingPage = () => {
             </div>
           </div>
 
-          {/* Top bidder */}
-          {topBidder && (
-            <div className="border border-yellow-500/20 bg-yellow-500/5 rounded-lg px-4 py-3 flex justify-between items-center">
-              <div>
-                <p className="text-white/30 text-xs uppercase tracking-widest mb-0.5">
-                  Top Bidder
-                </p>
-                <p className="text-white/80 text-sm font-medium">
-                  {topBidder.bidderName || getBidderName(topBidder.pubkey)}
-                </p>
-              </div>
-              <p className="text-yellow-400 font-bold text-lg">
-                {currentPrice.toLocaleString()} sats
-              </p>
-            </div>
-          )}
-
           {/* Current Price */}
           <div className="border border-white/10 rounded-lg p-4 bg-white/2">
             <p className="text-white/30 text-xs uppercase tracking-widest mb-2">
@@ -290,6 +273,23 @@ const BiddingPage = () => {
               Σ(bidAmt − deposit) across all bids
             </p>
           </div>
+
+          {/* Top bidder */}
+          {topBidder && (
+            <div className="border border-yellow-500/20 bg-yellow-500/5 rounded-lg px-4 py-3 flex justify-between items-center">
+              <div>
+                <p className="text-white/30 text-xs uppercase tracking-widest mb-0.5">
+                  Top Bidder
+                </p>
+                <p className="text-white/80 text-lg font-medium">
+                  {topBidder.bidderName || getBidderName(topBidder.pubkey)}
+                </p>
+              </div>
+              <p className="text-yellow-400 font-bold text-lg">
+                {currentPrice.toLocaleString()} sats
+              </p>
+            </div>
+          )}
         </div>
 
         {/* RIGHT */}
@@ -322,7 +322,7 @@ const BiddingPage = () => {
                   : "no bids yet"}
               </span>
             </p>
-            <div className="flex flex-wrap gap-2">
+            <div className="grid grid-cols-3 gap-2">
               {BID_PRESETS.map((amt) => (
                 <PresetBtn
                   key={amt}
@@ -337,7 +337,9 @@ const BiddingPage = () => {
           </div>
 
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-1">Deposit</p>
+            <p className="text-white font-semibold text-sm mb-1">
+              Submission Fee
+            </p>
             <p className="text-white/40 text-xs mb-4">
               Paid now via Lightning — deducted from final price
             </p>
