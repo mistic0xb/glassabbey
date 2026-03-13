@@ -1,24 +1,10 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useNavigate, useParams } from "react-router";
-import {
-  uniqueNamesGenerator,
-  adjectives,
-  colors,
-  animals,
-} from "unique-names-generator";
-import { generateSecretKey, getPublicKey } from "nostr-tools";
 import { fetchBidsForPiece, type Bid } from "../libs/nostr/bid";
 import { fetchPieceById } from "../libs/nostr/pieces";
 import { fetchAllCollections } from "../libs/nostr/collection";
 import { useAuction } from "../libs/useAuction";
 import type { Piece, Collection } from "../types/types";
-
-const getBidderName = (pubkey: string): string =>
-  uniqueNamesGenerator({
-    dictionaries: [adjectives, colors, animals],
-    separator: "-",
-    seed: pubkey,
-  });
 
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
@@ -68,10 +54,7 @@ const BiddingPage = () => {
   const [submitAmt, setSubmitAmt] = useState<number | null>(null);
   const [bidderName, setBidderName] = useState("");
 
-  const [myPubkey] = useState(() => getPublicKey(generateSecretKey()));
-  const fallbackName = getBidderName(myPubkey);
-  const displayName =
-    bidderName.trim() !== "" ? bidderName.trim().toLowerCase() : fallbackName;
+  const displayName = bidderName.trim().toLowerCase();
 
   // currentPrice from server = the live running price (source of truth)
   const { state: auction, submitBid } = useAuction(id ?? "");
@@ -189,7 +172,12 @@ const BiddingPage = () => {
   const isLocked = auction.status === "locked" || auction.status === "won";
 
   const canSubmit =
-    !!willingAmt && !!submitAmt && !isLocked && !!piece && !!collection;
+    !!willingAmt &&
+    !!submitAmt &&
+    !isLocked &&
+    !!piece &&
+    !!collection &&
+    displayName !== "";
 
   const handleSubmitBid = () => {
     if (!canSubmit || bidAmt === null || submitAmt === null) return;
@@ -199,6 +187,7 @@ const BiddingPage = () => {
   const submitLabel = () => {
     if (auction.status === "won") return "Proceeding to payment…";
     if (auction.status === "locked") return "Waiting — someone is paying…";
+    if (!displayName) return "Enter your name to bid";
     if (!bidAmt && !submitAmt) return "Select both amounts to bid";
     if (!bidAmt) return "Select a bid increment";
     if (!submitAmt) return "Select a submit amount";
@@ -282,7 +271,7 @@ const BiddingPage = () => {
                   Top Bidder
                 </p>
                 <p className="text-white/80 text-lg font-medium">
-                  {topBidder.bidderName || getBidderName(topBidder.pubkey)}
+                  {topBidder.bidderName}
                 </p>
               </div>
               <p className="text-yellow-400 font-bold text-lg">
@@ -370,16 +359,20 @@ const BiddingPage = () => {
           </div>
 
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
-            <p className="text-white font-semibold text-sm mb-1">Bidder Name</p>
+            <p className="text-white font-semibold text-sm mb-1">
+              Bidder Name <span className="text-red-400">*</span>
+            </p>
             <input
               value={bidderName}
               onChange={(e) => setBidderName(e.target.value)}
-              placeholder={fallbackName}
+              placeholder="Enter your name"
               className="w-full bg-white/5 border border-white/10 focus:border-white/30 outline-none text-white text-sm px-3 py-2 rounded transition-colors placeholder:text-white/20 mt-2"
             />
-            <p className="text-white/30 text-xs mt-2">
-              Bidding as <span className="text-white/60">{displayName}</span>
-            </p>
+            {displayName && (
+              <p className="text-white/30 text-xs mt-2">
+                Bidding as <span className="text-white/60">{displayName}</span>
+              </p>
+            )}
           </div>
 
           <div className="border border-white/10 rounded-lg p-5 bg-white/2">
@@ -414,7 +407,7 @@ const BiddingPage = () => {
                       #{i + 1}
                     </span>
                     <span className="text-white/50 truncate text-xs">
-                      {bid.bidderName || getBidderName(bid.pubkey)}
+                      {bid.bidderName}
                     </span>
                     <span
                       className={`font-semibold text-xs whitespace-nowrap ${i === 0 ? "text-green-400" : "text-white/60"}`}
