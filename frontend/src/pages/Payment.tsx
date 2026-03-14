@@ -11,6 +11,8 @@ import {
 import { generatePieceInvoice, monitorZapPayment } from "../libs/nostr/nip57";
 import { publishBid } from "../libs/nostr/bid";
 import { useAuction } from "../libs/useAuction";
+import { parseNWCString, pollInvoiceSettlement } from "../libs/nwc/nwc";
+import { getLatestNWC } from "../libs/nwc/nwcStorage";
 import type { Piece } from "../types/types";
 
 interface PaymentState {
@@ -41,7 +43,7 @@ async function publishBidWithRetry(
     try {
       onAttempt?.(attempt);
       await publishBid(pieceId, willingAmt, submitAmt, bidderName);
-      return; // success
+      return;
     } catch (err) {
       console.error(`publishBid attempt ${attempt} failed:`, err);
       if (attempt < PUBLISH_MAX_RETRIES) {
@@ -49,7 +51,6 @@ async function publishBidWithRetry(
       }
     }
   }
-  // All retries exhausted — throw so the caller can show the failure UI
   throw new Error("Failed to publish bid after all retries");
 }
 
@@ -58,6 +59,7 @@ const Payment = () => {
   const { state } = useLocation() as { state: PaymentState | null };
 
   const [invoice, setInvoice] = useState<string | null>(null);
+  const [paymentHash, setPaymentHash] = useState<string | null>(null);
   const [zapRequestId, setZapRequestId] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -68,8 +70,7 @@ const Payment = () => {
   const [publishAttempt, setPublishAttempt] = useState(0);
   const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
 
-  // Guards against double-processing if zap monitor fires twice
-  // (duplicate relay event, focus-recheck race, mobile reconnect)
+  // Guards against double-processing from NWC + zap firing simultaneously
   const handledRef = useRef(false);
 
   if (!state) {
@@ -87,9 +88,6 @@ const Payment = () => {
     bidderName,
   } = state;
 
-  // Use the shared socket — this is the socket the server's lock is bound to.
-  // confirmZap() sends ZAP_CONFIRMED on that same socket so the server's
-  // lock.ws identity check passes.
   const { cancelBid, confirmZap } = useAuction(piece.id);
 
   const handlePaymentConfirmed = useCallback(async () => {
@@ -97,8 +95,7 @@ const Payment = () => {
     handledRef.current = true;
     setStatus("publishing");
 
-    // Notify server first — this clears the lock and unblocks other bidders.
-    // Do this before publishBid so a relay failure doesn't leave everyone stuck.
+    // Notify server first — clears the lock and unblocks other bidders
     confirmZap();
 
     try {
@@ -111,9 +108,6 @@ const Payment = () => {
       );
       setStatus("confirmed");
     } catch (err) {
-      // Payment went through and server was notified, but we couldn't write
-      // to Nostr after all retries. Show a clear failure state so the user
-      // knows their sats were spent and can contact support.
       console.error("publishBid failed after all retries:", err);
       setStatus("publish_failed");
       return;
@@ -149,6 +143,7 @@ const Payment = () => {
         });
         setInvoice(result.invoice);
         setZapRequestId(result.zapRequestId);
+        setPaymentHash(result.paymentHash);
         setStatus("waiting");
       } catch (err) {
         setError(
@@ -161,27 +156,37 @@ const Payment = () => {
     generate();
   }, []);
 
-  // 2-minute countdown
+  // NWC polling — primary confirmation method when creator has NWC configured.
+  // Runs only if: invoice is ready, we have a payment_hash, and status is waiting.
+  // If NWC is not configured or probe fails, falls through silently to zap fallback.
   useEffect(() => {
-    if (status !== "waiting") return;
-    setTimeLeft(TIMER_SECONDS);
-    const interval = setInterval(() => {
-      setTimeLeft((t) => {
-        if (t <= 1) {
-          clearInterval(interval);
-          if (!handledRef.current) {
-            cancelBid();
-            navigate(-1);
-          }
-          return 0;
-        }
-        return t - 1;
-      });
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [status]);
+    if (!paymentHash || status !== "waiting") return;
 
-  // Primary zap monitor
+    const nwcString = getLatestNWC(lightningAddress);
+    if (!nwcString) return;
+
+    let cancelPoll: (() => void) | null = null;
+
+    const start = async () => {
+      try {
+        const config = parseNWCString(nwcString);
+        cancelPoll = pollInvoiceSettlement(
+          config,
+          paymentHash,
+          handlePaymentConfirmed,
+          { intervalMs: 3_000, timeoutMs: TIMER_SECONDS * 1000 },
+        );
+      } catch (e) {
+        console.warn("NWC setup failed, using zap fallback:", e);
+      }
+    };
+
+    start();
+    return () => cancelPoll?.();
+  }, [paymentHash, status, lightningAddress, handlePaymentConfirmed]);
+
+  // Zap receipt monitor — fallback when NWC is not configured or probe fails.
+  // handledRef ensures it never double-fires with NWC.
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
     const unsubscribe = monitorZapPayment(
@@ -196,8 +201,6 @@ const Payment = () => {
   useEffect(() => {
     if (status !== "waiting") return;
     const recheckOnFocus = () => {
-      // handledRef guards against double-processing if the primary monitor
-      // already fired while the app was backgrounded
       if (handledRef.current || !zapRequestId) return;
       const since = Math.floor(Date.now() / 1000) - 10 * 60;
       const unsub = monitorZapPayment(
@@ -221,6 +224,26 @@ const Payment = () => {
       window.removeEventListener("focus", recheckOnFocus);
     };
   }, [status, zapRequestId, recipientPubkey, handlePaymentConfirmed]);
+
+  // 2-minute countdown
+  useEffect(() => {
+    if (status !== "waiting") return;
+    setTimeLeft(TIMER_SECONDS);
+    const interval = setInterval(() => {
+      setTimeLeft((t) => {
+        if (t <= 1) {
+          clearInterval(interval);
+          if (!handledRef.current) {
+            cancelBid();
+            navigate(-1);
+          }
+          return 0;
+        }
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [status]);
 
   const handleCopy = () => {
     if (!invoice) return;
@@ -276,7 +299,6 @@ const Payment = () => {
   const timerSeconds = timeLeft % 60;
   const timerLabel = `${timerMinutes}:${String(timerSeconds).padStart(2, "0")}`;
 
-  // Payment went through but Nostr publish failed after all retries
   if (status === "publish_failed") {
     return (
       <div className="min-h-screen flex items-center justify-center p-4">
