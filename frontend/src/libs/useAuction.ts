@@ -128,12 +128,19 @@ export function useAuction(pieceId: string) {
   };
 
   const confirmZap = () => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "ZAP_CONFIRMED" }));
-    }
     intentionalRef.current = true;
-    closeSocket(pieceId);
+    const ws = getSocket(pieceId);
+    wsRef.current = ws;
+    const doSend = () => {
+      ws.send(JSON.stringify({ type: "ZAP_CONFIRMED" }));
+      setTimeout(() => closeSocket(pieceId), 500);
+    };
+    if (ws.readyState === WebSocket.OPEN) {
+      doSend();
+    } else {
+      ws.addEventListener("open", doSend, { once: true });
+      setTimeout(() => closeSocket(pieceId), 8000);
+    }
   };
 
   return { state, submitBid, cancelBid, confirmZap };

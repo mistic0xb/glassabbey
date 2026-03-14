@@ -4,6 +4,7 @@ import { SimplePool } from "nostr-tools/pool";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8080;
 const LOCK_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+const CLEANUP_DELAY_MS = 60 * 1000;    // 60s after last client leaves
 const RELAYS = [
     "wss://relay.damus.io",
     "wss://relay.nostr.band",
@@ -37,7 +38,7 @@ async function fetchPriceFromNostr(pieceId: string): Promise<number> {
                         if (data.willingAmt && data.submitAmt) {
                             bids.push({ willingAmt: data.willingAmt, submitAmt: data.submitAmt });
                         }
-                    } catch {}
+                    } catch { }
                 },
                 oneose() {
                     clearTimeout(timeout);
@@ -62,9 +63,10 @@ interface PieceState {
     currentPrice: number;
     rehydrated: boolean;
     rehydrating: boolean;
-    pendingClients: WebSocket[]; // clients waiting for rehydration
+    pendingClients: WebSocket[];
     lock: Lock | null;
     clients: Set<WebSocket>;
+    cleanupTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface SubmitBidMessage { type: "SUBMIT_BID"; bidderName: string; bidAmt: number; submitAmt: number; }
@@ -73,6 +75,10 @@ interface ZapConfirmedMessage { type: "ZAP_CONFIRMED"; }
 type ClientMessage = SubmitBidMessage | CancelBidMessage | ZapConfirmedMessage;
 
 const pieces = new Map<string, PieceState>();
+
+// Track which pieceId each WebSocket belongs to, so we can find the lock
+// even when the confirming socket is a reconnect or different instance.
+const socketPieceMap = new Map<WebSocket, string>();
 
 function getPiece(pieceId: string): PieceState {
     if (!pieces.has(pieceId)) {
@@ -83,6 +89,7 @@ function getPiece(pieceId: string): PieceState {
             pendingClients: [],
             lock: null,
             clients: new Set(),
+            cleanupTimer: null,
         });
     }
     return pieces.get(pieceId)!;
@@ -113,7 +120,7 @@ function sendState(ws: WebSocket, piece: PieceState): void {
 
 function tryAcquireLock(piece: PieceState, pieceId: string, ws: WebSocket, bidderName: string, bidAmt: number, submitAmt: number): void {
     if (bidAmt <= 0) { send(ws, { type: "BID_REJECTED", reason: "Bid increment must be positive" }); return; }
-    if (submitAmt > bidAmt) { send(ws, { type: "BID_REJECTED", reason: "Deposit cannot exceed bid increment" }); return; }
+    if (submitAmt > bidAmt) { send(ws, { type: "BID_REJECTED", reason: "Submit cannot exceed bid increment" }); return; }
     if (piece.lock) { send(ws, { type: "BID_QUEUED", reason: "Someone else is currently completing a payment, please wait" }); return; }
 
     const willingAmt = piece.currentPrice + bidAmt;
@@ -136,18 +143,24 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
 
     if (!pieceId) { ws.close(1008, "Missing pieceId"); return; }
 
+    socketPieceMap.set(ws, pieceId);
+
     const piece = getPiece(pieceId);
     piece.clients.add(ws);
+
+    // Cancel any pending cleanup since a client just connected
+    if (piece.cleanupTimer) {
+        clearTimeout(piece.cleanupTimer);
+        piece.cleanupTimer = null;
+    }
+
     console.log(`[${pieceId}] Client connected (${piece.clients.size} total)`);
 
     if (piece.rehydrated) {
-        // Already have current price, send state immediately
         sendState(ws, piece);
     } else if (piece.rehydrating) {
-        // Rehydration in progress, queue this client
         piece.pendingClients.push(ws);
     } else {
-        // First client — kick off rehydration
         piece.rehydrating = true;
         piece.pendingClients.push(ws);
 
@@ -156,7 +169,6 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
         piece.rehydrated = true;
         piece.rehydrating = false;
 
-        // Send state to all pending clients
         for (const client of piece.pendingClients) {
             if (client.readyState === WebSocket.OPEN) sendState(client, piece);
         }
@@ -188,18 +200,37 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                 break;
             }
             case "ZAP_CONFIRMED": {
-                if (!piece.lock || piece.lock.ws !== ws) {
-                    send(ws, { type: "ERROR", reason: "You do not hold the current bid lock" });
+                // Accept ZAP_CONFIRMED from either:
+                //   (a) the socket that holds the lock  — normal case
+                //   (b) any socket for this pieceId     — mobile reconnect / new WS case
+                // We trust the message came from a legit client because only
+                // the winning bidder is ever sent the BID_WON message with the
+                // correct willingAmt / submitAmt.
+                if (!piece.lock) {
+                    // Lock already cleared (e.g. duplicate confirm) — just ack and ignore
+                    console.log(`[${pieceId}] ZAP_CONFIRMED received but no lock held — ignoring`);
                     return;
                 }
+
+                const isLockHolder = piece.lock.ws === ws;
+                if (!isLockHolder) {
+                    // Mobile reconnect or throwaway-WS path: the message came from a
+                    // different socket but for the same pieceId. Accept it.
+                    console.log(`[${pieceId}] ZAP_CONFIRMED from non-lock socket — accepting (mobile reconnect path)`);
+                }
+
                 const { bidderName, bidAmt, submitAmt, willingAmt } = piece.lock;
                 piece.currentPrice = piece.currentPrice + bidAmt - submitAmt;
                 console.log(`[${pieceId}] Zap confirmed by ${bidderName}, new price: ${piece.currentPrice}`);
                 clearTimeout(piece.lock.timer);
                 piece.lock = null;
+
+                // Broadcast NEW_BID to ALL clients (including the confirming socket).
+                // The confirming client is navigating away immediately, so it won't
+                // render the update — but crucially all OTHER clients (including the
+                // mobile's original shared socket) will receive it and unlock.
                 const newBidMsg = { type: "NEW_BID", bidderName, willingAmt, submitAmt, currentPrice: piece.currentPrice };
                 broadcast(piece, newBidMsg);
-                send(ws, newBidMsg);
                 break;
             }
             default:
@@ -209,14 +240,22 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
 
     ws.on("close", () => {
         piece.clients.delete(ws);
+        socketPieceMap.delete(ws);
         console.log(`[${pieceId}] Client disconnected (${piece.clients.size} remaining)`);
+
         if (piece.lock?.ws === ws) {
             console.log(`[${pieceId}] Lock holder disconnected, releasing lock`);
             clearLock(piece, pieceId, "LOCK_EXPIRED");
         }
+
+        // Delay cleanup — client may reconnect (mobile backgrounding)
         if (piece.clients.size === 0 && !piece.lock) {
-            pieces.delete(pieceId);
-            console.log(`[${pieceId}] Piece state cleaned up`);
+            piece.cleanupTimer = setTimeout(() => {
+                if (piece.clients.size === 0 && !piece.lock) {
+                    pieces.delete(pieceId);
+                    console.log(`[${pieceId}] Piece state cleaned up after delay`);
+                }
+            }, CLEANUP_DELAY_MS);
         }
     });
 

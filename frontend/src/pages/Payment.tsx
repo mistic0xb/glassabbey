@@ -20,7 +20,7 @@ interface PaymentState {
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
-const TIMER_SECONDS = 120; // 2 minutes
+const TIMER_SECONDS = 120;
 
 const Payment = () => {
   const navigate = useNavigate();
@@ -31,32 +31,61 @@ const Payment = () => {
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState<"idle" | "waiting" | "publishing" | "confirmed">("idle");
+  const [status, setStatus] = useState<
+    "idle" | "waiting" | "publishing" | "confirmed"
+  >("idle");
   const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
 
   const handledRef = useRef(false);
 
-  if (!state) { navigate(-1); return null; }
+  if (!state) {
+    navigate(-1);
+    return null;
+  }
 
-  const { piece, collectionName, lightningAddress, recipientPubkey, willingAmt, submitAmt, bidderName } = state;
+  const {
+    piece,
+    collectionName,
+    lightningAddress,
+    recipientPubkey,
+    willingAmt,
+    submitAmt,
+    bidderName,
+  } = state;
 
-  const { confirmZap, cancelBid } = useAuction(piece.id);
+  // Use the shared socket — this is the socket the server's lock is bound to
+  const { cancelBid, confirmZap } = useAuction(piece.id);
 
   const handlePaymentConfirmed = useCallback(async () => {
     if (handledRef.current) return;
     handledRef.current = true;
     setStatus("publishing");
+
     try {
       await publishBid(piece.id, willingAmt, submitAmt, bidderName);
-      confirmZap();
     } catch (err) {
       console.error("Failed to publish bid after payment:", err);
-      confirmZap();
-    } finally {
-      setStatus("confirmed");
-      setTimeout(() => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }), 3000);
     }
-  }, [piece, willingAmt, submitAmt, bidderName, collectionName, navigate, confirmZap]);
+
+    // Send ZAP_CONFIRMED via the SAME shared socket the server locked to.
+    // confirmZap() handles the send + socket cleanup internally.
+    confirmZap();
+
+    setStatus("confirmed");
+    setTimeout(
+      () =>
+        navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }),
+      3000,
+    );
+  }, [
+    piece,
+    willingAmt,
+    submitAmt,
+    bidderName,
+    collectionName,
+    navigate,
+    confirmZap,
+  ]);
 
   // Generate invoice on mount
   useEffect(() => {
@@ -75,7 +104,9 @@ const Payment = () => {
         setZapRequestId(result.zapRequestId);
         setStatus("waiting");
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to generate invoice");
+        setError(
+          err instanceof Error ? err.message : "Failed to generate invoice",
+        );
       } finally {
         setGenerating(false);
       }
@@ -83,7 +114,7 @@ const Payment = () => {
     generate();
   }, []);
 
-  // 2-minute countdown — starts when invoice is ready, auto-cancels on expiry
+  // 2-minute countdown
   useEffect(() => {
     if (status !== "waiting") return;
     setTimeLeft(TIMER_SECONDS);
@@ -106,7 +137,11 @@ const Payment = () => {
   // Primary zap monitor
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
-    const unsubscribe = monitorZapPayment(recipientPubkey, zapRequestId, handlePaymentConfirmed);
+    const unsubscribe = monitorZapPayment(
+      recipientPubkey,
+      zapRequestId,
+      handlePaymentConfirmed,
+    );
     return () => unsubscribe();
   }, [invoice, zapRequestId, status, handlePaymentConfirmed]);
 
@@ -119,7 +154,10 @@ const Payment = () => {
       const unsub = monitorZapPayment(
         recipientPubkey,
         zapRequestId,
-        () => { unsub(); handlePaymentConfirmed(); },
+        () => {
+          unsub();
+          handlePaymentConfirmed();
+        },
         since,
       );
       setTimeout(() => unsub(), 10_000);
@@ -137,9 +175,36 @@ const Payment = () => {
 
   const handleCopy = () => {
     if (!invoice) return;
-    navigator.clipboard.writeText(invoice);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    const done = () => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    };
+    try {
+      navigator.clipboard
+        .writeText(invoice)
+        .then(done)
+        .catch(() => {
+          const el = document.createElement("textarea");
+          el.value = invoice;
+          el.style.cssText = "position:fixed;opacity:0";
+          document.body.appendChild(el);
+          el.focus();
+          el.select();
+          document.execCommand("copy");
+          document.body.removeChild(el);
+          done();
+        });
+    } catch {
+      const el = document.createElement("textarea");
+      el.value = invoice;
+      el.style.cssText = "position:fixed;opacity:0";
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      document.execCommand("copy");
+      document.body.removeChild(el);
+      done();
+    }
   };
 
   const handleOpenWallet = () => {
@@ -152,7 +217,12 @@ const Payment = () => {
     navigate(-1);
   };
 
-  const timerColor = timeLeft <= 30 ? "text-red-400" : timeLeft <= 60 ? "text-yellow-400" : "text-white/40";
+  const timerColor =
+    timeLeft <= 30
+      ? "text-red-400"
+      : timeLeft <= 60
+        ? "text-yellow-400"
+        : "text-white/40";
   const timerMinutes = Math.floor(timeLeft / 60);
   const timerSeconds = timeLeft % 60;
   const timerLabel = `${timerMinutes}:${String(timerSeconds).padStart(2, "0")}`;
@@ -165,15 +235,21 @@ const Payment = () => {
             <FiCheck className="text-green-400 text-3xl" />
           </div>
           <div>
-            <h2 className="text-white font-bold text-xl mb-1">Payment Confirmed</h2>
+            <h2 className="text-white font-bold text-xl mb-1">
+              Payment Confirmed
+            </h2>
             <p className="text-white/40 text-sm">
-              {status === "publishing" ? "Publishing your bid…" : "Bid recorded. Returning to piece…"}
+              {status === "publishing"
+                ? "Publishing your bid…"
+                : "Bid recorded. Returning to piece…"}
             </p>
           </div>
           <div className="border border-white/10 rounded px-4 py-2 text-sm">
             <span className="text-white/60">{bidderName}</span>
             <span className="text-white/20 mx-2">·</span>
-            <span className="text-green-400 font-semibold">{formatSats(submitAmt)} sats</span>
+            <span className="text-green-400 font-semibold">
+              {formatSats(submitAmt)} sats
+            </span>
           </div>
         </div>
       </div>
@@ -209,16 +285,21 @@ const Payment = () => {
       <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
         <div className="flex justify-between items-start">
           <div>
-            <p className="text-white/30 text-xs uppercase tracking-widest mb-1">{collectionName}</p>
-            <h1 className="text-white font-semibold text-lg">{piece.artifactName}</h1>
+            <p className="text-white/30 text-xs uppercase tracking-widest mb-1">
+              {collectionName}
+            </p>
+            <h1 className="text-white font-semibold text-lg">
+              {piece.artifactName}
+            </h1>
             <p className="text-white/40 text-sm mt-1">
               Bidding as <span className="text-white/70">{bidderName}</span>
             </p>
           </div>
-          {/* Countdown timer */}
           <div className="flex flex-col items-end">
             <p className="text-white/20 text-xs mb-0.5">Time left</p>
-            <p className={`font-mono font-bold text-lg tabular-nums ${timerColor}`}>
+            <p
+              className={`font-mono font-bold text-lg tabular-nums ${timerColor}`}
+            >
               {timerLabel}
             </p>
           </div>
@@ -226,7 +307,9 @@ const Payment = () => {
 
         <div className="flex justify-between items-center bg-white/5 border border-white/10 rounded-lg px-4 py-3">
           <span className="text-white/40 text-sm">Deposit amount</span>
-          <span className="text-green-400 font-bold text-xl">{formatSats(submitAmt)} sats</span>
+          <span className="text-green-400 font-bold text-xl">
+            {formatSats(submitAmt)} sats
+          </span>
         </div>
 
         {invoice && (
@@ -238,12 +321,22 @@ const Payment = () => {
               onClick={handleCopy}
               className="flex items-center gap-2 text-white/40 hover:text-white text-sm transition-colors bg-transparent border-none cursor-pointer"
             >
-              {copied ? <><FiCheck className="text-green-400" /> Copied</> : <><FiCopy /> Copy invoice</>}
+              {copied ? (
+                <>
+                  <FiCheck className="text-green-400" /> Copied
+                </>
+              ) : (
+                <>
+                  <FiCopy /> Copy invoice
+                </>
+              )}
             </button>
           </div>
         )}
 
-        <p className="text-white/20 text-xs text-center animate-pulse">Waiting for payment…</p>
+        <p className="text-white/20 text-xs text-center animate-pulse">
+          Waiting for payment…
+        </p>
 
         <div className="flex flex-col gap-2">
           <button
