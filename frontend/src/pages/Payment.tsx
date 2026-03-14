@@ -1,7 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { QRCodeSVG } from "qrcode.react";
-import { FiCheck, FiCopy, FiZap, FiArrowLeft } from "react-icons/fi";
+import {
+  FiCheck,
+  FiCopy,
+  FiZap,
+  FiArrowLeft,
+  FiAlertTriangle,
+} from "react-icons/fi";
 import { generatePieceInvoice, monitorZapPayment } from "../libs/nostr/nip57";
 import { publishBid } from "../libs/nostr/bid";
 import { useAuction } from "../libs/useAuction";
@@ -21,6 +27,31 @@ const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
 const TIMER_SECONDS = 120;
+const PUBLISH_MAX_RETRIES = 3;
+const PUBLISH_RETRY_DELAY_MS = 2000;
+
+async function publishBidWithRetry(
+  pieceId: string,
+  willingAmt: number,
+  submitAmt: number,
+  bidderName: string,
+  onAttempt?: (attempt: number) => void,
+): Promise<void> {
+  for (let attempt = 1; attempt <= PUBLISH_MAX_RETRIES; attempt++) {
+    try {
+      onAttempt?.(attempt);
+      await publishBid(pieceId, willingAmt, submitAmt, bidderName);
+      return; // success
+    } catch (err) {
+      console.error(`publishBid attempt ${attempt} failed:`, err);
+      if (attempt < PUBLISH_MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, PUBLISH_RETRY_DELAY_MS));
+      }
+    }
+  }
+  // All retries exhausted — throw so the caller can show the failure UI
+  throw new Error("Failed to publish bid after all retries");
+}
 
 const Payment = () => {
   const navigate = useNavigate();
@@ -32,10 +63,13 @@ const Payment = () => {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<
-    "idle" | "waiting" | "publishing" | "confirmed"
+    "idle" | "waiting" | "publishing" | "publish_failed" | "confirmed"
   >("idle");
+  const [publishAttempt, setPublishAttempt] = useState(0);
   const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
 
+  // Guards against double-processing if zap monitor fires twice
+  // (duplicate relay event, focus-recheck race, mobile reconnect)
   const handledRef = useRef(false);
 
   if (!state) {
@@ -53,7 +87,9 @@ const Payment = () => {
     bidderName,
   } = state;
 
-  // Use the shared socket — this is the socket the server's lock is bound to
+  // Use the shared socket — this is the socket the server's lock is bound to.
+  // confirmZap() sends ZAP_CONFIRMED on that same socket so the server's
+  // lock.ws identity check passes.
   const { cancelBid, confirmZap } = useAuction(piece.id);
 
   const handlePaymentConfirmed = useCallback(async () => {
@@ -61,17 +97,28 @@ const Payment = () => {
     handledRef.current = true;
     setStatus("publishing");
 
-    try {
-      await publishBid(piece.id, willingAmt, submitAmt, bidderName);
-    } catch (err) {
-      console.error("Failed to publish bid after payment:", err);
-    }
-
-    // Send ZAP_CONFIRMED via the SAME shared socket the server locked to.
-    // confirmZap() handles the send + socket cleanup internally.
+    // Notify server first — this clears the lock and unblocks other bidders.
+    // Do this before publishBid so a relay failure doesn't leave everyone stuck.
     confirmZap();
 
-    setStatus("confirmed");
+    try {
+      await publishBidWithRetry(
+        piece.id,
+        willingAmt,
+        submitAmt,
+        bidderName,
+        (attempt) => setPublishAttempt(attempt),
+      );
+      setStatus("confirmed");
+    } catch (err) {
+      // Payment went through and server was notified, but we couldn't write
+      // to Nostr after all retries. Show a clear failure state so the user
+      // knows their sats were spent and can contact support.
+      console.error("publishBid failed after all retries:", err);
+      setStatus("publish_failed");
+      return;
+    }
+
     setTimeout(
       () =>
         navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }),
@@ -145,10 +192,12 @@ const Payment = () => {
     return () => unsubscribe();
   }, [invoice, zapRequestId, status, handlePaymentConfirmed]);
 
-  // Recheck on focus/visibility — mobile
+  // Recheck on focus/visibility — mobile wallet returns to browser
   useEffect(() => {
     if (status !== "waiting") return;
     const recheckOnFocus = () => {
+      // handledRef guards against double-processing if the primary monitor
+      // already fired while the app was backgrounded
       if (handledRef.current || !zapRequestId) return;
       const since = Math.floor(Date.now() / 1000) - 10 * 60;
       const unsub = monitorZapPayment(
@@ -227,7 +276,74 @@ const Payment = () => {
   const timerSeconds = timeLeft % 60;
   const timerLabel = `${timerMinutes}:${String(timerSeconds).padStart(2, "0")}`;
 
+  // Payment went through but Nostr publish failed after all retries
+  if (status === "publish_failed") {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="border border-yellow-500/30 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-yellow-500/5">
+          <div className="w-16 h-16 rounded-full bg-yellow-500/10 border border-yellow-500/30 flex items-center justify-center">
+            <FiAlertTriangle className="text-yellow-400 text-3xl" />
+          </div>
+          <div>
+            <h2 className="text-white font-bold text-xl mb-2">
+              Payment received, bid not recorded
+            </h2>
+            <p className="text-white/50 text-sm leading-relaxed">
+              Your payment of{" "}
+              <span className="text-white/80">
+                {formatSats(submitAmt)} sats
+              </span>{" "}
+              went through, but we couldn't write your bid to the relay. Please
+              contact support with the details below.
+            </p>
+          </div>
+          <div className="border border-white/10 rounded-lg px-4 py-3 text-xs text-left w-full flex flex-col gap-1">
+            <p className="text-white/30">
+              Piece: <span className="text-white/60">{piece.artifactName}</span>
+            </p>
+            <p className="text-white/30">
+              Bidder: <span className="text-white/60">{bidderName}</span>
+            </p>
+            <p className="text-white/30">
+              Willing amt:{" "}
+              <span className="text-white/60">
+                {willingAmt.toLocaleString()} sats
+              </span>
+            </p>
+            <p className="text-white/30">
+              Deposit:{" "}
+              <span className="text-white/60">
+                {submitAmt.toLocaleString()} sats
+              </span>
+            </p>
+            <p className="text-white/30">
+              Piece ID:{" "}
+              <span className="text-white/60 font-mono break-all">
+                {piece.id}
+              </span>
+            </p>
+          </div>
+          <button
+            onClick={() =>
+              navigate(`/piece/${piece.id}`, {
+                state: { piece, collectionName },
+              })
+            }
+            className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer"
+          >
+            Return to piece
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (status === "confirmed" || status === "publishing") {
+    const publishingLabel =
+      publishAttempt > 1
+        ? `Publishing bid (attempt ${publishAttempt}/${PUBLISH_MAX_RETRIES})…`
+        : "Publishing your bid…";
+
     return (
       <div className="min-h-screen flex items-center justify-center p-4">
         <div className="border border-white/10 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-white/2">
@@ -240,7 +356,7 @@ const Payment = () => {
             </h2>
             <p className="text-white/40 text-sm">
               {status === "publishing"
-                ? "Publishing your bid…"
+                ? publishingLabel
                 : "Bid recorded. Returning to piece…"}
             </p>
           </div>
