@@ -25,3 +25,4 @@ dist-ssr
 *.excalidraw
 todos.md
 .env
+nwc.json

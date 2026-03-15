@@ -11,8 +11,6 @@ import {
 import { generatePieceInvoice, monitorZapPayment } from "../libs/nostr/nip57";
 import { publishBid } from "../libs/nostr/bid";
 import { useAuction } from "../libs/useAuction";
-import { parseNWCString, pollInvoiceSettlement } from "../libs/nwc/nwc";
-import { getLatestNWC } from "../libs/nwc/nwcStorage";
 import type { Piece } from "../types/types";
 
 interface PaymentState {
@@ -59,7 +57,6 @@ const Payment = () => {
   const { state } = useLocation() as { state: PaymentState | null };
 
   const [invoice, setInvoice] = useState<string | null>(null);
-  const [paymentHash, setPaymentHash] = useState<string | null>(null);
   const [zapRequestId, setZapRequestId] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -70,7 +67,7 @@ const Payment = () => {
   const [publishAttempt, setPublishAttempt] = useState(0);
   const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
 
-  // Guards against double-processing from NWC + zap firing simultaneously
+  // Guards against double-processing from server PAYMENT_CONFIRMED + zap firing simultaneously
   const handledRef = useRef(false);
 
   if (!state) {
@@ -88,14 +85,14 @@ const Payment = () => {
     bidderName,
   } = state;
 
-  const { cancelBid, confirmZap } = useAuction(piece.id);
+  const { cancelBid, confirmZap, state: auctionState } = useAuction(piece.id);
 
   const handlePaymentConfirmed = useCallback(async () => {
     if (handledRef.current) return;
     handledRef.current = true;
     setStatus("publishing");
 
-    // Notify server first — clears the lock and unblocks other bidders
+    // Notify server — clears the lock and unblocks other bidders
     confirmZap();
 
     try {
@@ -128,15 +125,15 @@ const Payment = () => {
     confirmZap,
   ]);
 
-  // Stable ref so NWC polling never needs handlePaymentConfirmed in its deps.
-  // Without this, any re-render that gives handlePaymentConfirmed a new reference
-  // would cancel and restart the poll, breaking confirmation.
-  const handlePaymentConfirmedRef = useRef(handlePaymentConfirmed);
+  // Listen for PAYMENT_CONFIRMED from server (sent when NWC poll detects settlement).
+  // useAuction already handles the WS — we watch for the new message type here.
   useEffect(() => {
-    handlePaymentConfirmedRef.current = handlePaymentConfirmed;
-  }, [handlePaymentConfirmed]);
+    if (auctionState.status === ("payment_confirmed" as any)) {
+      handlePaymentConfirmed();
+    }
+  }, [auctionState.status, handlePaymentConfirmed]);
 
-  // Generate invoice on mount
+  // Generate invoice on mount, then immediately tell server to start NWC polling
   useEffect(() => {
     const generate = async () => {
       setGenerating(true);
@@ -151,8 +148,32 @@ const Payment = () => {
         });
         setInvoice(result.invoice);
         setZapRequestId(result.zapRequestId);
-        setPaymentHash(result.paymentHash);
         setStatus("waiting");
+
+        // Tell server to start NWC polling if a payment_hash was extracted
+        if (result.paymentHash) {
+          // submitBid-style send via the shared socket in useAuction
+          // We use a raw WS message — the shared socket is already open
+          const wsUrl = `${import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080"}?pieceId=${piece.id}`;
+          // Send START_PAYMENT on the existing auction socket by piggy-backing
+          // on a direct send (useAuction exposes the socket indirectly via submitBid)
+          // Simplest: open a short-lived connection just for this message
+          const ws = new WebSocket(wsUrl);
+          ws.onopen = () => {
+            ws.send(
+              JSON.stringify({
+                type: "START_PAYMENT",
+                paymentHash: result.paymentHash,
+                lightningAddress,
+              }),
+            );
+            // Don't close — keep alive so PAYMENT_CONFIRMED can arrive on this socket
+            // Actually the main auction socket (from useAuction) will receive the broadcast.
+            // This socket is redundant after sending — close it.
+            setTimeout(() => ws.close(), 1000);
+          };
+          ws.onerror = () => ws.close();
+        }
       } catch (err) {
         setError(
           err instanceof Error ? err.message : "Failed to generate invoice",
@@ -164,61 +185,8 @@ const Payment = () => {
     generate();
   }, []);
 
-  // NWC polling — primary confirmation method when creator has NWC configured.
-  // Deps intentionally exclude handlePaymentConfirmed — we use the ref instead
-  // so the effect never restarts mid-poll due to callback identity changes.
-  useEffect(() => {
-    console.log("[NWC] effect run", { paymentHash, status, lightningAddress });
-    if (!paymentHash || status !== "waiting") return;
-
-    const nwcString = getLatestNWC(lightningAddress);
-    if (!nwcString) {
-      console.log(
-        "[NWC] no NWC configured for",
-        lightningAddress,
-        "— zap fallback active",
-      );
-      return;
-    }
-
-    let cancelPoll: (() => void) | null = null;
-
-    const start = async () => {
-      try {
-        const config = parseNWCString(nwcString);
-        console.log("[NWC] polling started", {
-          relay: config.relayUrl,
-          paymentHash,
-        });
-        cancelPoll = pollInvoiceSettlement(
-          config,
-          paymentHash,
-          () => {
-            console.log("[NWC] payment settled — confirming bid");
-            handlePaymentConfirmedRef.current();
-          },
-          { intervalMs: 3_000, timeoutMs: TIMER_SECONDS * 1000 },
-        );
-      } catch (e) {
-        console.warn("[NWC] setup failed — zap fallback active:", e);
-      }
-    };
-
-    start();
-    return () => {
-      console.log("[NWC] effect cleanup", {
-        paymentHash,
-        status,
-        lightningAddress,
-      });
-      console.log("[NWC] polling stopped");
-
-      cancelPoll?.();
-    };
-  }, [paymentHash, status, lightningAddress]);
-
-  // Zap receipt monitor — fallback when NWC is not configured or fails.
-  // handledRef ensures it never double-fires with NWC.
+  // Zap receipt monitor — fallback when NWC is not configured or server poll fails.
+  // handledRef ensures it never double-fires with server PAYMENT_CONFIRMED.
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
     const unsubscribe = monitorZapPayment(
@@ -397,7 +365,6 @@ const Payment = () => {
       publishAttempt > 1
         ? `Publishing bid (attempt ${publishAttempt}/${PUBLISH_MAX_RETRIES})…`
         : "Publishing your bid…";
-
     return (
       <div className="min-h-screen flex items-center justify-center p-4">
         <div className="border border-white/10 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-white/2">

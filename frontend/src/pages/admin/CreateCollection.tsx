@@ -2,7 +2,8 @@ import { useState } from "react";
 import { useNavigate } from "react-router";
 import { v4 as uuidv4 } from "uuid";
 import { validateNWCString } from "../../libs/nwc/nwc";
-import { saveNWC } from "../../libs/nwc/nwcStorage";
+
+const WS_URL = import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080";
 
 const Field = ({
   label,
@@ -12,7 +13,6 @@ const Field = ({
   type = "text",
   required = false,
   error,
-  hint,
 }: {
   label: string;
   value: string;
@@ -21,7 +21,6 @@ const Field = ({
   type?: string;
   required?: boolean;
   error?: string;
-  hint?: string;
 }) => (
   <div className="flex flex-col gap-1">
     <label className="text-xs text-white/40 uppercase tracking-widest">
@@ -38,10 +37,41 @@ const Field = ({
         error ? "border-red-500/60" : "border-white/10"
       }`}
     />
-    {hint && !error && <p className="text-white/25 text-xs">{hint}</p>}
     {error && <p className="text-red-400 text-xs">{error}</p>}
   </div>
 );
+
+// Send NWC string to server via a short-lived WS connection.
+// Fire-and-forget — errors are non-fatal, collection creation proceeds either way.
+function registerNWC(lightningAddress: string, nwcString: string): void {
+  try {
+    const ws = new WebSocket(`${WS_URL}?action=register`);
+    const timeout = setTimeout(() => ws.close(), 8_000);
+    ws.onopen = () => {
+      ws.send(
+        JSON.stringify({ type: "REGISTER_NWC", lightningAddress, nwcString }),
+      );
+    };
+    ws.onmessage = (msg) => {
+      try {
+        const data = JSON.parse(msg.data as string);
+        if (data.type === "NWC_REGISTERED") {
+          console.log("[NWC] Registered on server for", lightningAddress);
+        }
+      } catch {}
+      clearTimeout(timeout);
+      ws.close();
+    };
+    ws.onerror = () => {
+      clearTimeout(timeout);
+      console.warn(
+        "[NWC] Failed to register on server — server-side NWC polling unavailable",
+      );
+    };
+  } catch (e) {
+    console.warn("[NWC] registerNWC error:", e);
+  }
+}
 
 const CreateCollection = () => {
   const navigate = useNavigate();
@@ -66,21 +96,18 @@ const CreateCollection = () => {
     const e: Record<string, string> = {};
     if (!name.trim()) e.name = "Required.";
     if (!lightningAddress.trim()) e.lightningAddress = "Required.";
-
-    // Validate NWC if provided
     if (nwcString.trim()) {
       const nwcErr = validateNWCString(nwcString.trim());
       if (nwcErr) e.nwc = nwcErr;
     }
-
     if (Object.keys(e).length) {
       setErrors(e);
       return;
     }
 
-    // Save NWC locally — never sent to any server or Nostr relay
+    // Register NWC on server — fire and forget, non-blocking
     if (nwcString.trim() && !errors.nwc) {
-      saveNWC(lightningAddress.trim(), nwcString.trim());
+      registerNWC(lightningAddress.trim(), nwcString.trim());
     }
 
     const id = uuidv4();
@@ -98,7 +125,6 @@ const CreateCollection = () => {
   return (
     <div className="min-h-screen flex justify-center px-6 py-10">
       <div className="w-full max-w-lg">
-        {/* Back */}
         <button
           onClick={() => navigate("/admin/dashboard")}
           className="text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
@@ -106,7 +132,6 @@ const CreateCollection = () => {
           ← Dashboard
         </button>
 
-        {/* Heading */}
         <div className="mb-8">
           <h1 className="text-2xl font-bold text-white">New Collection</h1>
           <p className="text-white/40 text-sm mt-1">
@@ -114,7 +139,6 @@ const CreateCollection = () => {
           </p>
         </div>
 
-        {/* Form */}
         <div className="border border-white/10 rounded-lg p-6 flex flex-col gap-5 bg-white/2">
           <Field
             label="Collection Name"
@@ -142,7 +166,7 @@ const CreateCollection = () => {
 
           <div className="border-t border-white/10" />
 
-          {/* NWC — optional, improves payment confirmation reliability */}
+          {/* NWC — optional, enables server-side payment confirmation */}
           <div className="flex flex-col gap-1">
             <label className="text-xs text-white/40 uppercase tracking-widest">
               Wallet Connect (NWC)
@@ -163,14 +187,14 @@ const CreateCollection = () => {
             />
             {errors.nwc && <p className="text-red-400 text-xs">{errors.nwc}</p>}
             {nwcString && !errors.nwc && (
-              <p className="text-green-400/60 text-xs">✓ Valid NWC string</p>
+              <p className="text-green-400/60 text-xs">
+                ✓ Valid — payment confirmations will work with any wallet
+              </p>
             )}
-            {/* Privacy note — shown when field is empty or focused */}
             {!nwcString && (
               <p className="text-white/20 text-xs leading-relaxed">
-                Enables direct payment confirmation — recommended for Blink,
-                Wallet of Satoshi, and other wallets. Stored only in this
-                browser, never shared.
+                Recommended for Blink, Wallet of Satoshi, and other wallets.
+                Stored securely on the auction server — never published.
               </p>
             )}
           </div>
@@ -192,7 +216,6 @@ const CreateCollection = () => {
             placeholder="https://…"
           />
 
-          {/* Banner preview */}
           {bannerUrl && (
             <div
               className="h-24 rounded overflow-hidden border border-white/10 bg-cover bg-center"
@@ -201,7 +224,6 @@ const CreateCollection = () => {
           )}
         </div>
 
-        {/* Submit */}
         <div className="flex justify-end mt-6">
           <button
             onClick={handleNext}

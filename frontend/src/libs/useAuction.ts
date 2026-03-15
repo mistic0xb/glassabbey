@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from "react";
 
 const WS_URL = import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080";
 
-export type AuctionStatus = "connecting" | "idle" | "locked" | "won" | "error";
+export type AuctionStatus =
+  | "connecting"
+  | "idle"
+  | "locked"
+  | "won"
+  | "payment_confirmed"
+  | "error";
 
 export interface WonDetails {
   finalBidAmt: number;
@@ -80,6 +86,10 @@ export function useAuction(pieceId: string) {
         case "NEW_BID":
           setState(s => ({ ...s, status: "idle", currentHighestBid: msg.currentPrice, wonDetails: null, errorMsg: null }));
           break;
+        case "PAYMENT_CONFIRMED":
+          // Server-side NWC poll detected payment — signal Payment.tsx to proceed
+          setState(s => ({ ...s, status: "payment_confirmed" }));
+          break;
         case "ERROR":
           setState(s => ({ ...s, errorMsg: msg.reason }));
           break;
@@ -93,7 +103,6 @@ export function useAuction(pieceId: string) {
       }
     };
 
-    // If already open, just attach handlers and request state
     if (ws.readyState === WebSocket.OPEN) {
       setState(s => ({ ...s, status: "idle" }));
     }
