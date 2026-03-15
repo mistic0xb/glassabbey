@@ -11,8 +11,9 @@ import * as path from "path";
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8080;
 const LOCK_TIMEOUT_MS = 2 * 60 * 1000;
 const CLEANUP_DELAY_MS = 60 * 1000;
-const NWC_POLL_INTERVAL_MS = 3_000;
+const NWC_WS_REFRESH_MS = 30_000; // reconnect NWC subscription every 30s
 const NWC_FILE = path.join(process.cwd(), "nwc.json");
+const BIDS_FILE = path.join(process.cwd(), "bids.json");
 
 const RELAYS = [
     "wss://relay.damus.io",
@@ -20,7 +21,44 @@ const RELAYS = [
     "wss://nos.lol",
 ];
 
-// ─── NWC storage (JSON file, keyed by lightningAddress) ───────────────────────
+// ─── bids.json — ground truth for currentPrice ───────────────────────────────
+// Written every time a bid is confirmed. Read on rehydration instead of
+// fetching from Nostr relays — eliminates relay propagation race conditions.
+
+interface BidRecord {
+    currentPrice: number;
+    bidderName: string;
+    willingAmt: number;
+    submitAmt: number;
+    confirmedAt: number; // unix ms
+}
+
+function readBidsStore(): Record<string, BidRecord> {
+    try {
+        if (!fs.existsSync(BIDS_FILE)) return {};
+        return JSON.parse(fs.readFileSync(BIDS_FILE, "utf-8"));
+    } catch {
+        return {};
+    }
+}
+
+function writeBid(pieceId: string, record: BidRecord): void {
+    try {
+        const store = readBidsStore();
+        store[pieceId] = record;
+        fs.writeFileSync(BIDS_FILE, JSON.stringify(store, null, 2));
+        console.log(`[${pieceId}] bids.json updated — currentPrice=${record.currentPrice}`);
+    } catch (e) {
+        console.error(`[${pieceId}] Failed to write bids.json:`, e);
+    }
+}
+
+function getStoredPrice(pieceId: string): number | null {
+    const store = readBidsStore();
+    return store[pieceId]?.currentPrice ?? null;
+}
+
+// ─── nwc.json — NWC strings keyed by lightningAddress ────────────────────────
 
 function readNWCStore(): Record<string, string> {
     try {
@@ -51,7 +89,7 @@ function getNWC(lightningAddress: string): string | null {
     return store[lightningAddress.toLowerCase().trim()] ?? null;
 }
 
-// ─── NWC client (NIP-44 + NIP-04 fallback) ───────────────────────────────────
+// ─── NWC client ───────────────────────────────────────────────────────────────
 
 interface NWCConfig {
     walletPubkey: string;
@@ -74,15 +112,6 @@ function parseNWCString(nwcString: string): NWCConfig {
     return { walletPubkey, relayUrl, secret, encryptionMode: "nip44" };
 }
 
-async function nwcEncrypt(config: NWCConfig, plaintext: string): Promise<string> {
-    const privkeyBytes = hexToBytes(config.secret);
-    if (config.encryptionMode === "nip44") {
-        const convKey = nip44.getConversationKey(privkeyBytes, config.walletPubkey);
-        return nip44.encrypt(plaintext, convKey);
-    }
-    return nip04.encrypt(config.secret, config.walletPubkey, plaintext);
-}
-
 async function nwcDecrypt(config: NWCConfig, ciphertext: string): Promise<string> {
     const privkeyBytes = hexToBytes(config.secret);
     try {
@@ -93,81 +122,8 @@ async function nwcDecrypt(config: NWCConfig, ciphertext: string): Promise<string
     }
 }
 
-async function lookupInvoice(config: NWCConfig, paymentHash: string): Promise<string> {
-    const privkeyBytes = hexToBytes(config.secret);
-    const clientPubkey = getPublicKey(privkeyBytes);
-
-    const payload = JSON.stringify({ method: "lookup_invoice", params: { payment_hash: paymentHash } });
-    const encrypted = await nwcEncrypt(config, payload);
-
-    const encryptionTag = config.encryptionMode === "nip44" ? [["encryption", "nip44_v2"]] : [];
-    const requestEvent = finalizeEvent(
-        {
-            kind: 23194,
-            created_at: Math.floor(Date.now() / 1000),
-            tags: [...encryptionTag, ["p", config.walletPubkey]],
-            content: encrypted,
-        },
-        privkeyBytes,
-    );
-
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        const finish = (fn: () => void) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            try { if (ws.readyState === ws.OPEN) ws.close(); } catch { }
-            fn();
-        };
-
-        const timer = setTimeout(() => finish(() => reject(new Error("NWC lookup_invoice timed out"))), 10_000);
-
-        const ws = new (require("ws"))(config.relayUrl);
-
-        ws.on("open", () => {
-            const subId = Math.random().toString(36).slice(2);
-            ws.send(JSON.stringify(["REQ", subId, {
-                kinds: [23195],
-                authors: [config.walletPubkey],
-                "#p": [clientPubkey],
-                "#e": [requestEvent.id],
-                since: Math.floor(Date.now() / 1000) - 5,
-            }]));
-            ws.send(JSON.stringify(["EVENT", requestEvent]));
-        });
-
-        ws.on("message", async (raw: Buffer) => {
-            if (settled) return;
-            try {
-                const data = JSON.parse(raw.toString());
-                if (!Array.isArray(data) || data[0] !== "EVENT") return;
-                const event = data[2];
-                if (!event?.content) return;
-                let decrypted: string;
-                try {
-                    decrypted = await nwcDecrypt(config, event.content);
-                } catch {
-                    const flipped = { ...config, encryptionMode: config.encryptionMode === "nip44" ? "nip04" : "nip44" } as NWCConfig;
-                    decrypted = await nwcDecrypt(flipped, event.content);
-                }
-                const parsed = JSON.parse(decrypted);
-                if (parsed.error) {
-                    finish(() => reject(new Error(`NWC error: ${parsed.error.message}`)));
-                } else {
-                    finish(() => resolve(parsed.result?.state ?? "pending"));
-                }
-            } catch (e) {
-                finish(() => reject(e));
-            }
-        });
-
-        ws.on("error", (e: Error) => finish(() => reject(e)));
-        ws.on("close", () => { if (!settled) finish(() => reject(new Error("NWC WS closed early"))); });
-    });
-}
-
-// ─── Nostr rehydration ────────────────────────────────────────────────────────
+// ─── Nostr rehydration — fallback only if bids.json has no entry ──────────────
+// Waits for EOSE from ALL relays (or 7s timeout) to avoid partial-relay races.
 
 const pieceBidTag = (pieceId: string) => `glassabbey-bid:${pieceId}`;
 
@@ -175,14 +131,19 @@ async function fetchPriceFromNostr(pieceId: string): Promise<number> {
     const pool = new SimplePool();
     return new Promise((resolve) => {
         const bids: { willingAmt: number; submitAmt: number }[] = [];
+        let eoseCount = 0;
+
         const done = () => {
             pool.close(RELAYS);
             const top = bids.sort((a, b) => b.willingAmt - a.willingAmt)[0];
             const price = top ? top.willingAmt - top.submitAmt : 0;
-            console.log(`[${pieceId}] Rehydrated currentPrice=${price} from ${bids.length} nostr bids`);
+            console.log(`[${pieceId}] Nostr rehydration: currentPrice=${price} from ${bids.length} bids`);
             resolve(price);
         };
-        const timeout = setTimeout(done, 5000);
+
+        // Wait up to 7s — longer than before to let slow relays respond
+        const timeout = setTimeout(done, 7000);
+
         const sub = pool.subscribeMany(
             RELAYS,
             { kinds: [30078], "#t": [pieceBidTag(pieceId)], limit: 100 },
@@ -195,7 +156,16 @@ async function fetchPriceFromNostr(pieceId: string): Promise<number> {
                         }
                     } catch { }
                 },
-                oneose() { clearTimeout(timeout); sub.close(); done(); },
+                oneose() {
+                    eoseCount++;
+                    console.log(`[${pieceId}] Nostr EOSE ${eoseCount}/${RELAYS.length}`);
+                    // Only resolve once ALL relays have sent EOSE
+                    if (eoseCount >= RELAYS.length) {
+                        clearTimeout(timeout);
+                        sub.close();
+                        done();
+                    }
+                },
             }
         );
     });
@@ -212,11 +182,14 @@ interface Lock {
     timer: ReturnType<typeof setTimeout>;
 }
 
-interface NWCPoll {
-    timer: ReturnType<typeof setTimeout> | null;
+// Active NWC notification subscription for a piece
+interface NWCSubscription {
     cancelled: boolean;
     paymentHash: string;
     lightningAddress: string;
+    ws: InstanceType<typeof WebSocket> | null;
+    refreshTimer: ReturnType<typeof setTimeout> | null;
+    lockStartTime: number; // for since= on reconnect
 }
 
 interface PieceState {
@@ -226,7 +199,7 @@ interface PieceState {
     pendingClients: WebSocket[];
     lock: Lock | null;
     lastConfirmedWillingAmt: number | null;
-    nwcPoll: NWCPoll | null;
+    nwcSub: NWCSubscription | null;
     clients: Set<WebSocket>;
     cleanupTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -250,7 +223,7 @@ function getPiece(pieceId: string): PieceState {
             pendingClients: [],
             lock: null,
             lastConfirmedWillingAmt: null,
-            nwcPoll: null,
+            nwcSub: null,
             clients: new Set(),
             cleanupTimer: null,
         });
@@ -298,23 +271,78 @@ function tryAcquireLock(piece: PieceState, pieceId: string, ws: WebSocket, bidde
     broadcast(piece, { type: "BID_LOCKED", reason: "A bidder is completing payment, please wait" }, ws);
 }
 
-// ─── NWC polling (server-side) ────────────────────────────────────────────────
+// ─── Confirm payment (single source of truth) ─────────────────────────────────
+// Called by BOTH NWC notification path and ZAP_CONFIRMED path.
+// Updates currentPrice in memory AND writes to bids.json atomically.
+// Eliminates the client round-trip — server is the authority.
 
-function stopNWCPoll(piece: PieceState, pieceId: string): void {
-    if (!piece.nwcPoll) return;
-    piece.nwcPoll.cancelled = true;
-    if (piece.nwcPoll.timer) clearTimeout(piece.nwcPoll.timer);
-    piece.nwcPoll = null;
-    console.log(`[${pieceId}] NWC poll stopped`);
+function confirmPayment(piece: PieceState, pieceId: string, source: "nwc" | "zap"): void {
+    if (!piece.lock) {
+        console.log(`[${pieceId}] confirmPayment(${source}) — no lock held, ignoring`);
+        return;
+    }
+
+    const { bidderName, bidAmt, submitAmt, willingAmt } = piece.lock;
+
+    // Dedup guard — same willingAmt can arrive from both NWC and zap
+    if (piece.lastConfirmedWillingAmt === willingAmt) {
+        console.log(`[${pieceId}] confirmPayment(${source}) — duplicate willingAmt=${willingAmt}, ignoring`);
+        return;
+    }
+
+    console.log(`[${pieceId}] Payment confirmed via ${source} by ${bidderName}, willingAmt=${willingAmt}`);
+
+    // Stop NWC subscription — no longer needed
+    stopNWCSub(piece, pieceId);
+
+    // Update price atomically in memory + disk
+    const newPrice = piece.currentPrice + bidAmt - submitAmt;
+    piece.lastConfirmedWillingAmt = willingAmt;
+    piece.currentPrice = newPrice;
+
+    // Write to bids.json — ground truth for rehydration
+    writeBid(pieceId, {
+        currentPrice: newPrice,
+        bidderName,
+        willingAmt,
+        submitAmt,
+        confirmedAt: Date.now(),
+    });
+
+    // Clear lock
+    clearTimeout(piece.lock.timer);
+    piece.lock = null;
+
+    // Broadcast to ALL clients — bidder's Payment.tsx watches for NEW_BID
+    // with matching willingAmt to detect their own confirmation
+    console.log(`[${pieceId}] Broadcasting NEW_BID — new currentPrice=${newPrice}`);
+    broadcast(piece, { type: "NEW_BID", bidderName, willingAmt, submitAmt, currentPrice: newPrice });
 }
 
-function startNWCPoll(piece: PieceState, pieceId: string, paymentHash: string, lightningAddress: string): void {
-    // Stop any existing poll first
-    stopNWCPoll(piece, pieceId);
+// ─── NWC notification subscription ───────────────────────────────────────────
+// Subscribes to kind 23197 (payment_received) from the wallet service.
+// Reconnects every 30s to prevent silent WS drops.
+// Uses `since=lockStartTime` on reconnect so no events are missed.
+
+function stopNWCSub(piece: PieceState, pieceId: string): void {
+    if (!piece.nwcSub) return;
+    piece.nwcSub.cancelled = true;
+    if (piece.nwcSub.refreshTimer) clearTimeout(piece.nwcSub.refreshTimer);
+    try {
+        if (piece.nwcSub.ws && piece.nwcSub.ws.readyState === WebSocket.OPEN) {
+            piece.nwcSub.ws.close();
+        }
+    } catch { }
+    piece.nwcSub = null;
+    console.log(`[${pieceId}] NWC subscription stopped`);
+}
+
+function startNWCSub(piece: PieceState, pieceId: string, paymentHash: string, lightningAddress: string): void {
+    stopNWCSub(piece, pieceId);
 
     const nwcString = getNWC(lightningAddress);
     if (!nwcString) {
-        console.log(`[${pieceId}] No NWC string for ${lightningAddress} — skipping NWC poll`);
+        console.log(`[${pieceId}] No NWC string for ${lightningAddress} — NWC unavailable, zap fallback only`);
         return;
     }
 
@@ -322,72 +350,127 @@ function startNWCPoll(piece: PieceState, pieceId: string, paymentHash: string, l
     try {
         config = parseNWCString(nwcString);
     } catch (e) {
-        console.error(`[${pieceId}] Invalid NWC string for ${lightningAddress}:`, e);
+        console.error(`[${pieceId}] Invalid NWC string:`, e);
         return;
     }
 
-    const poll: NWCPoll = { timer: null, cancelled: false, paymentHash, lightningAddress };
-    piece.nwcPoll = poll;
+    const sub: NWCSubscription = {
+        cancelled: false,
+        paymentHash,
+        lightningAddress,
+        ws: null,
+        refreshTimer: null,
+        lockStartTime: Math.floor(Date.now() / 1000),
+    };
+    piece.nwcSub = sub;
 
-    const startTime = Date.now();
-    const TIMEOUT_MS = LOCK_TIMEOUT_MS;
+    const privkeyBytes = hexToBytes(config.secret);
+    const clientPubkey = getPublicKey(privkeyBytes);
 
-    console.log(`[${pieceId}] NWC poll started for paymentHash=${paymentHash}`);
+    const connect = (since: number) => {
+        if (sub.cancelled) return;
 
-    const check = async () => {
-        if (poll.cancelled) return;
-        if (Date.now() - startTime > TIMEOUT_MS) {
-            console.log(`[${pieceId}] NWC poll timed out`);
-            stopNWCPoll(piece, pieceId);
+        console.log(`[${pieceId}] NWC subscription connecting (since=${since})`);
+
+        let ws: InstanceType<typeof WebSocket>;
+        try {
+            ws = new (require("ws"))(config.relayUrl);
+        } catch (e) {
+            console.error(`[${pieceId}] NWC WS connect error:`, e);
             return;
         }
+        sub.ws = ws;
 
-        try {
-            const state = await lookupInvoice(config, paymentHash);
-            console.log(`[${pieceId}] NWC lookup_invoice state=${state}`);
+        ws.on("open", () => {
+            if (sub.cancelled) { ws.close(); return; }
+            console.log(`[${pieceId}] NWC subscription open — listening for payment_received`);
 
-            if (poll.cancelled) return;
+            const subId = Math.random().toString(36).slice(2);
+            // Subscribe to kind 23197 (payment_received notifications)
+            ws.send(JSON.stringify(["REQ", subId, {
+                kinds: [23197],
+                authors: [config.walletPubkey],
+                "#p": [clientPubkey],
+                since,
+            }]));
+        });
 
-            if (state === "settled") {
-                console.log(`[${pieceId}] NWC confirmed payment settled`);
-                stopNWCPoll(piece, pieceId);
-                // Broadcast to all clients — Payment.tsx listens for this
-                broadcast(piece, { type: "PAYMENT_CONFIRMED" });
-                return;
+        ws.on("message", async (raw: Buffer) => {
+            if (sub.cancelled) return;
+            try {
+                const data = JSON.parse(raw.toString());
+                if (!Array.isArray(data) || data[0] !== "EVENT") return;
+                const event = data[2];
+                if (!event?.content) return;
+
+                console.log(`[${pieceId}] NWC notification event received`);
+
+                let decrypted: string;
+                try {
+                    decrypted = await nwcDecrypt(config, event.content);
+                } catch {
+                    const flipped = { ...config, encryptionMode: config.encryptionMode === "nip44" ? "nip04" : "nip44" } as NWCConfig;
+                    decrypted = await nwcDecrypt(flipped, event.content);
+                }
+
+                const parsed = JSON.parse(decrypted);
+                console.log(`[${pieceId}] NWC notification type=${parsed.notification_type}`);
+
+                if (parsed.notification_type !== "payment_received") return;
+
+                const notification = parsed.notification;
+                const notifPaymentHash = notification?.payment_hash;
+
+                console.log(`[${pieceId}] NWC payment_received — payment_hash=${notifPaymentHash}, expected=${sub.paymentHash}`);
+
+                if (notifPaymentHash !== sub.paymentHash) {
+                    console.log(`[${pieceId}] NWC payment_received — hash mismatch, ignoring`);
+                    return;
+                }
+
+                console.log(`[${pieceId}] NWC payment_received — hash matched! Confirming payment`);
+                confirmPayment(piece, pieceId, "nwc");
+
+            } catch (e) {
+                console.warn(`[${pieceId}] NWC notification parse error:`, e);
             }
+        });
 
-            if (state === "expired" || state === "failed") {
-                console.log(`[${pieceId}] NWC invoice ${state} — stopping poll`);
-                stopNWCPoll(piece, pieceId);
-                return;
-            }
+        ws.on("error", (e: Error) => {
+            console.warn(`[${pieceId}] NWC subscription WS error:`, e.message);
+        });
 
-            // pending / accepted — keep polling
-            if (!poll.cancelled) {
-                poll.timer = setTimeout(check, NWC_POLL_INTERVAL_MS);
+        ws.on("close", () => {
+            if (!sub.cancelled) {
+                console.log(`[${pieceId}] NWC subscription WS closed unexpectedly`);
             }
-        } catch (e) {
-            console.warn(`[${pieceId}] NWC lookup error (retrying):`, e);
-            if (!poll.cancelled) {
-                poll.timer = setTimeout(check, NWC_POLL_INTERVAL_MS);
-            }
-        }
+        });
+
+        // Schedule refresh — reconnect before relay silently drops connection
+        sub.refreshTimer = setTimeout(() => {
+            if (sub.cancelled) return;
+            console.log(`[${pieceId}] NWC subscription refresh — reconnecting`);
+            try { ws.close(); } catch { }
+            // Use lockStartTime as since= so we never miss a payment
+            // that arrived during the brief reconnect window
+            connect(sub.lockStartTime);
+        }, NWC_WS_REFRESH_MS);
     };
 
-    check();
+    console.log(`[${pieceId}] NWC subscription starting for paymentHash=${paymentHash}`);
+    connect(sub.lockStartTime);
 }
 
 // ─── WebSocket server ─────────────────────────────────────────────────────────
 
 const wss = new WebSocketServer({ port: PORT });
 
-// Separate handler for NWC registration (no pieceId needed)
 wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const url = new URL(req.url ?? "", `http://localhost`);
     const pieceId = url.searchParams.get("pieceId");
     const action = url.searchParams.get("action");
 
-    // ── NWC registration endpoint: ?action=register ──
+    // ── NWC registration: ?action=register ──
     if (action === "register") {
         ws.on("message", (raw: Buffer) => {
             try {
@@ -395,6 +478,7 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                 if (msg.type === "REGISTER_NWC" && msg.lightningAddress && msg.nwcString) {
                     saveNWC(msg.lightningAddress, msg.nwcString);
                     send(ws, { type: "NWC_REGISTERED" });
+                    console.log(`[register] NWC registered for ${msg.lightningAddress}`);
                 }
             } catch {
                 send(ws, { type: "ERROR", reason: "Invalid message" });
@@ -423,8 +507,18 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     } else {
         piece.rehydrating = true;
         piece.pendingClients.push(ws);
-        const price = await fetchPriceFromNostr(pieceId);
-        piece.currentPrice = price;
+
+        // Try bids.json first — fast, always correct
+        const storedPrice = getStoredPrice(pieceId);
+        if (storedPrice !== null) {
+            console.log(`[${pieceId}] Rehydrated from bids.json: currentPrice=${storedPrice}`);
+            piece.currentPrice = storedPrice;
+        } else {
+            // No local record — fall back to Nostr relay fetch
+            console.log(`[${pieceId}] No bids.json entry — fetching from Nostr relays`);
+            piece.currentPrice = await fetchPriceFromNostr(pieceId);
+        }
+
         piece.rehydrated = true;
         piece.rehydrating = false;
         for (const client of piece.pendingClients) {
@@ -438,7 +532,7 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
         try { msg = JSON.parse(raw.toString()) as ClientMessage; }
         catch { send(ws, { type: "ERROR", reason: "Invalid JSON" }); return; }
 
-        console.log(`[${pieceId}] Message:`, msg.type);
+        console.log(`[${pieceId}] Message: ${msg.type}`);
 
         switch (msg.type) {
             case "SUBMIT_BID": {
@@ -455,8 +549,7 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                     console.log(`[${pieceId}] Lock cancelled by ${piece.lock.bidderName}`);
                     clearLock(piece, pieceId, "LOCK_EXPIRED");
                 }
-                // Also stop any NWC poll
-                stopNWCPoll(piece, pieceId);
+                stopNWCSub(piece, pieceId);
                 break;
             }
             case "START_PAYMENT": {
@@ -465,37 +558,21 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                     send(ws, { type: "ERROR", reason: "Missing paymentHash or lightningAddress" });
                     return;
                 }
-                console.log(`[${pieceId}] START_PAYMENT received for ${lightningAddress}`);
-                startNWCPoll(piece, pieceId, paymentHash, lightningAddress);
+                console.log(`[${pieceId}] START_PAYMENT — starting NWC subscription for ${lightningAddress}`);
+                startNWCSub(piece, pieceId, paymentHash, lightningAddress);
                 break;
             }
             case "ZAP_CONFIRMED": {
+                // Fallback path — client detected payment via zap receipt monitor
+                // confirmPayment handles dedup so NWC + zap can never double-fire
                 if (!piece.lock) {
-                    console.log(`[${pieceId}] ZAP_CONFIRMED with no lock held — ignoring`);
+                    console.log(`[${pieceId}] ZAP_CONFIRMED — no lock held, ignoring`);
                     return;
                 }
-
-                const { bidderName, bidAmt, submitAmt, willingAmt } = piece.lock;
-
-                if (piece.lastConfirmedWillingAmt === willingAmt) {
-                    console.log(`[${pieceId}] ZAP_CONFIRMED duplicate willingAmt=${willingAmt} — ignoring`);
-                    return;
-                }
-
                 if (piece.lock.ws !== ws) {
                     console.log(`[${pieceId}] ZAP_CONFIRMED from non-lock socket — accepting (mobile path)`);
                 }
-
-                // Stop NWC poll — payment already confirmed via zap
-                stopNWCPoll(piece, pieceId);
-
-                piece.lastConfirmedWillingAmt = willingAmt;
-                piece.currentPrice = piece.currentPrice + bidAmt - submitAmt;
-                console.log(`[${pieceId}] Zap confirmed by ${bidderName}, new price: ${piece.currentPrice}`);
-                clearTimeout(piece.lock.timer);
-                piece.lock = null;
-
-                broadcast(piece, { type: "NEW_BID", bidderName, willingAmt, submitAmt, currentPrice: piece.currentPrice });
+                confirmPayment(piece, pieceId, "zap");
                 break;
             }
             default:
@@ -508,23 +585,23 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
         console.log(`[${pieceId}] Client disconnected (${piece.clients.size} remaining)`);
 
         if (piece.lock?.ws === ws) {
-            console.log(`[${pieceId}] Lock holder disconnected, releasing lock`);
+            console.log(`[${pieceId}] Lock holder disconnected — releasing lock`);
             clearLock(piece, pieceId, "LOCK_EXPIRED");
-            stopNWCPoll(piece, pieceId);
+            stopNWCSub(piece, pieceId);
         }
 
         if (piece.clients.size === 0 && !piece.lock) {
             piece.cleanupTimer = setTimeout(() => {
                 if (piece.clients.size === 0 && !piece.lock) {
-                    stopNWCPoll(piece, pieceId);
+                    stopNWCSub(piece, pieceId);
                     pieces.delete(pieceId);
-                    console.log(`[${pieceId}] Piece state cleaned up after delay`);
+                    console.log(`[${pieceId}] Piece state cleaned up`);
                 }
             }, CLEANUP_DELAY_MS);
         }
     });
 
-    ws.on("error", (err: Error) => console.error(`[${pieceId}] WebSocket error:`, err));
+    ws.on("error", (err: Error) => console.error(`[${pieceId}] WS error:`, err));
 });
 
 console.log(`Auction server running on ws://localhost:${PORT}`);

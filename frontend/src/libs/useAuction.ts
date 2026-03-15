@@ -7,7 +7,6 @@ export type AuctionStatus =
   | "idle"
   | "locked"
   | "won"
-  | "payment_confirmed"
   | "error";
 
 export interface WonDetails {
@@ -19,6 +18,7 @@ export interface WonDetails {
 export interface AuctionState {
   status: AuctionStatus;
   currentHighestBid: number;
+  lastNewBidWillingAmt: number | null; // willingAmt from the most recent NEW_BID
   wonDetails: WonDetails | null;
   errorMsg: string | null;
 }
@@ -46,6 +46,7 @@ export function useAuction(pieceId: string) {
   const [state, setState] = useState<AuctionState>({
     status: "connecting",
     currentHighestBid: 0,
+    lastNewBidWillingAmt: null,
     wonDetails: null,
     errorMsg: null,
   });
@@ -66,10 +67,22 @@ export function useAuction(pieceId: string) {
 
       switch (msg.type) {
         case "STATE":
-          setState(s => ({ ...s, currentHighestBid: msg.currentPrice, status: msg.locked ? "locked" : "idle" }));
+          setState(s => ({
+            ...s,
+            currentHighestBid: msg.currentPrice,
+            status: msg.locked ? "locked" : "idle",
+          }));
           break;
         case "BID_WON":
-          setState(s => ({ ...s, status: "won", wonDetails: { finalBidAmt: msg.willingAmt, submitAmt: msg.submitAmt, bidderName: msg.bidderName } }));
+          setState(s => ({
+            ...s,
+            status: "won",
+            wonDetails: {
+              finalBidAmt: msg.willingAmt,
+              submitAmt: msg.submitAmt,
+              bidderName: msg.bidderName,
+            },
+          }));
           break;
         case "BID_QUEUED":
           setState(s => ({ ...s, status: "locked", errorMsg: msg.reason }));
@@ -84,11 +97,15 @@ export function useAuction(pieceId: string) {
           setState(s => ({ ...s, status: "idle", errorMsg: null }));
           break;
         case "NEW_BID":
-          setState(s => ({ ...s, status: "idle", currentHighestBid: msg.currentPrice, wonDetails: null, errorMsg: null }));
-          break;
-        case "PAYMENT_CONFIRMED":
-          // Server-side NWC poll detected payment — signal Payment.tsx to proceed
-          setState(s => ({ ...s, status: "payment_confirmed" }));
+          // Carry willingAmt so Payment.tsx can match its own bid confirmation
+          setState(s => ({
+            ...s,
+            status: "idle",
+            currentHighestBid: msg.currentPrice,
+            lastNewBidWillingAmt: msg.willingAmt ?? null,
+            wonDetails: null,
+            errorMsg: null,
+          }));
           break;
         case "ERROR":
           setState(s => ({ ...s, errorMsg: msg.reason }));

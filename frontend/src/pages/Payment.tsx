@@ -13,6 +13,8 @@ import { publishBid } from "../libs/nostr/bid";
 import { useAuction } from "../libs/useAuction";
 import type { Piece } from "../types/types";
 
+const WS_URL = import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080";
+
 interface PaymentState {
   piece: Piece;
   collectionName: string;
@@ -67,7 +69,7 @@ const Payment = () => {
   const [publishAttempt, setPublishAttempt] = useState(0);
   const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
 
-  // Guards against double-processing from server PAYMENT_CONFIRMED + zap firing simultaneously
+  // Guards against double-processing from NWC notification + zap receipt firing simultaneously
   const handledRef = useRef(false);
 
   if (!state) {
@@ -85,6 +87,7 @@ const Payment = () => {
     bidderName,
   } = state;
 
+  // useAuction gives us access to the shared WS and auction state
   const { cancelBid, confirmZap, state: auctionState } = useAuction(piece.id);
 
   const handlePaymentConfirmed = useCallback(async () => {
@@ -92,9 +95,7 @@ const Payment = () => {
     handledRef.current = true;
     setStatus("publishing");
 
-    // Notify server — clears the lock and unblocks other bidders
-    confirmZap();
-
+    // Server already updated currentPrice — just publish to Nostr
     try {
       await publishBidWithRetry(
         piece.id,
@@ -111,29 +112,32 @@ const Payment = () => {
     }
 
     setTimeout(
-      () =>
-        navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }),
+      () => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }),
       3000,
     );
-  }, [
-    piece,
-    willingAmt,
-    submitAmt,
-    bidderName,
-    collectionName,
-    navigate,
-    confirmZap,
-  ]);
+  }, [piece, willingAmt, submitAmt, bidderName, collectionName, navigate]);
 
-  // Listen for PAYMENT_CONFIRMED from server (sent when NWC poll detects settlement).
-  // useAuction already handles the WS — we watch for the new message type here.
+  // Watch for NEW_BID with our willingAmt — this is how server signals our payment confirmed.
+  // Server broadcasts NEW_BID after both NWC notification AND ZAP_CONFIRMED paths.
+  // Using willingAmt match means we only react to our own bid, not others'.
   useEffect(() => {
-    if (auctionState.status === ("payment_confirmed" as any)) {
-      handlePaymentConfirmed();
+    if (status !== "waiting") return;
+    if (auctionState.status === "idle" &&
+        auctionState.currentHighestBid > 0 &&
+        // NEW_BID for our willingAmt means our payment was confirmed by server
+        auctionState.wonDetails === null) {
+      // Check if the currentHighestBid corresponds to our bid being confirmed.
+      // Server sets currentPrice = currentPrice + bidAmt - submitAmt after our bid.
+      // willingAmt - submitAmt = the new currentPrice after our bid.
+      const expectedNewPrice = willingAmt - submitAmt;
+      if (auctionState.currentHighestBid === expectedNewPrice) {
+        console.log("[Payment] NEW_BID matches our willingAmt — payment confirmed by server");
+        handlePaymentConfirmed();
+      }
     }
-  }, [auctionState.status, handlePaymentConfirmed]);
+  }, [auctionState.status, auctionState.currentHighestBid, status, willingAmt, submitAmt, handlePaymentConfirmed]);
 
-  // Generate invoice on mount, then immediately tell server to start NWC polling
+  // Generate invoice on mount, then send START_PAYMENT to server
   useEffect(() => {
     const generate = async () => {
       setGenerating(true);
@@ -150,34 +154,24 @@ const Payment = () => {
         setZapRequestId(result.zapRequestId);
         setStatus("waiting");
 
-        // Tell server to start NWC polling if a payment_hash was extracted
+        // Tell server to start NWC notification subscription
         if (result.paymentHash) {
-          // submitBid-style send via the shared socket in useAuction
-          // We use a raw WS message — the shared socket is already open
-          const wsUrl = `${import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080"}?pieceId=${piece.id}`;
-          // Send START_PAYMENT on the existing auction socket by piggy-backing
-          // on a direct send (useAuction exposes the socket indirectly via submitBid)
-          // Simplest: open a short-lived connection just for this message
-          const ws = new WebSocket(wsUrl);
+          console.log("[Payment] Sending START_PAYMENT to server, paymentHash=", result.paymentHash);
+          const ws = new WebSocket(`${WS_URL}?pieceId=${piece.id}`);
           ws.onopen = () => {
-            ws.send(
-              JSON.stringify({
-                type: "START_PAYMENT",
-                paymentHash: result.paymentHash,
-                lightningAddress,
-              }),
-            );
-            // Don't close — keep alive so PAYMENT_CONFIRMED can arrive on this socket
-            // Actually the main auction socket (from useAuction) will receive the broadcast.
-            // This socket is redundant after sending — close it.
+            ws.send(JSON.stringify({
+              type: "START_PAYMENT",
+              paymentHash: result.paymentHash,
+              lightningAddress,
+            }));
             setTimeout(() => ws.close(), 1000);
           };
           ws.onerror = () => ws.close();
+        } else {
+          console.warn("[Payment] No paymentHash extracted from bolt11 — NWC unavailable, zap fallback only");
         }
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to generate invoice",
-        );
+        setError(err instanceof Error ? err.message : "Failed to generate invoice");
       } finally {
         setGenerating(false);
       }
@@ -185,17 +179,26 @@ const Payment = () => {
     generate();
   }, []);
 
-  // Zap receipt monitor — fallback when NWC is not configured or server poll fails.
-  // handledRef ensures it never double-fires with server PAYMENT_CONFIRMED.
+  // Zap receipt monitor — client-side fallback.
+  // If server NWC notification fires first, handledRef prevents double-processing.
+  // If zap fires first, it calls confirmZap() which sends ZAP_CONFIRMED to server,
+  // server calls confirmPayment() which updates price + broadcasts NEW_BID.
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
     const unsubscribe = monitorZapPayment(
       recipientPubkey,
       zapRequestId,
-      handlePaymentConfirmed,
+      () => {
+        console.log("[Payment] Zap receipt detected — sending ZAP_CONFIRMED to server");
+        // Send ZAP_CONFIRMED to server — server handles price update + NEW_BID broadcast
+        confirmZap();
+        // handlePaymentConfirmed will be triggered by the NEW_BID watch above
+        // but also call it directly as belt-and-suspenders in case WS is slow
+        handlePaymentConfirmed();
+      },
     );
     return () => unsubscribe();
-  }, [invoice, zapRequestId, status, handlePaymentConfirmed]);
+  }, [invoice, zapRequestId, status, handlePaymentConfirmed, confirmZap]);
 
   // Recheck on focus/visibility — mobile wallet returns to browser
   useEffect(() => {
@@ -208,6 +211,8 @@ const Payment = () => {
         zapRequestId,
         () => {
           unsub();
+          console.log("[Payment] Zap recheck detected payment — sending ZAP_CONFIRMED");
+          confirmZap();
           handlePaymentConfirmed();
         },
         since,
@@ -223,7 +228,7 @@ const Payment = () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("focus", recheckOnFocus);
     };
-  }, [status, zapRequestId, recipientPubkey, handlePaymentConfirmed]);
+  }, [status, zapRequestId, recipientPubkey, handlePaymentConfirmed, confirmZap]);
 
   // 2-minute countdown
   useEffect(() => {
@@ -247,32 +252,24 @@ const Payment = () => {
 
   const handleCopy = () => {
     if (!invoice) return;
-    const done = () => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    };
+    const done = () => { setCopied(true); setTimeout(() => setCopied(false), 2000); };
     try {
-      navigator.clipboard
-        .writeText(invoice)
-        .then(done)
-        .catch(() => {
-          const el = document.createElement("textarea");
-          el.value = invoice;
-          el.style.cssText = "position:fixed;opacity:0";
-          document.body.appendChild(el);
-          el.focus();
-          el.select();
-          document.execCommand("copy");
-          document.body.removeChild(el);
-          done();
-        });
+      navigator.clipboard.writeText(invoice).then(done).catch(() => {
+        const el = document.createElement("textarea");
+        el.value = invoice;
+        el.style.cssText = "position:fixed;opacity:0";
+        document.body.appendChild(el);
+        el.focus(); el.select();
+        document.execCommand("copy");
+        document.body.removeChild(el);
+        done();
+      });
     } catch {
       const el = document.createElement("textarea");
       el.value = invoice;
       el.style.cssText = "position:fixed;opacity:0";
       document.body.appendChild(el);
-      el.focus();
-      el.select();
+      el.focus(); el.select();
       document.execCommand("copy");
       document.body.removeChild(el);
       done();
@@ -290,11 +287,7 @@ const Payment = () => {
   };
 
   const timerColor =
-    timeLeft <= 30
-      ? "text-red-400"
-      : timeLeft <= 60
-        ? "text-yellow-400"
-        : "text-white/40";
+    timeLeft <= 30 ? "text-red-400" : timeLeft <= 60 ? "text-yellow-400" : "text-white/40";
   const timerMinutes = Math.floor(timeLeft / 60);
   const timerSeconds = timeLeft % 60;
   const timerLabel = `${timerMinutes}:${String(timerSeconds).padStart(2, "0")}`;
@@ -307,50 +300,23 @@ const Payment = () => {
             <FiAlertTriangle className="text-yellow-400 text-3xl" />
           </div>
           <div>
-            <h2 className="text-white font-bold text-xl mb-2">
-              Payment received, bid not recorded
-            </h2>
+            <h2 className="text-white font-bold text-xl mb-2">Payment received, bid not recorded</h2>
             <p className="text-white/50 text-sm leading-relaxed">
               Your payment of{" "}
-              <span className="text-white/80">
-                {formatSats(submitAmt)} sats
-              </span>{" "}
-              went through, but we couldn't write your bid to the relay. Please
-              contact support with the details below.
+              <span className="text-white/80">{formatSats(submitAmt)} sats</span>{" "}
+              went through, but we couldn't write your bid to the relay.
+              Please contact support with the details below.
             </p>
           </div>
           <div className="border border-white/10 rounded-lg px-4 py-3 text-xs text-left w-full flex flex-col gap-1">
-            <p className="text-white/30">
-              Piece: <span className="text-white/60">{piece.artifactName}</span>
-            </p>
-            <p className="text-white/30">
-              Bidder: <span className="text-white/60">{bidderName}</span>
-            </p>
-            <p className="text-white/30">
-              Willing amt:{" "}
-              <span className="text-white/60">
-                {willingAmt.toLocaleString()} sats
-              </span>
-            </p>
-            <p className="text-white/30">
-              Deposit:{" "}
-              <span className="text-white/60">
-                {submitAmt.toLocaleString()} sats
-              </span>
-            </p>
-            <p className="text-white/30">
-              Piece ID:{" "}
-              <span className="text-white/60 font-mono break-all">
-                {piece.id}
-              </span>
-            </p>
+            <p className="text-white/30">Piece: <span className="text-white/60">{piece.artifactName}</span></p>
+            <p className="text-white/30">Bidder: <span className="text-white/60">{bidderName}</span></p>
+            <p className="text-white/30">Willing amt: <span className="text-white/60">{willingAmt.toLocaleString()} sats</span></p>
+            <p className="text-white/30">Deposit: <span className="text-white/60">{submitAmt.toLocaleString()} sats</span></p>
+            <p className="text-white/30">Piece ID: <span className="text-white/60 font-mono break-all">{piece.id}</span></p>
           </div>
           <button
-            onClick={() =>
-              navigate(`/piece/${piece.id}`, {
-                state: { piece, collectionName },
-              })
-            }
+            onClick={() => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } })}
             className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer"
           >
             Return to piece
@@ -372,21 +338,15 @@ const Payment = () => {
             <FiCheck className="text-green-400 text-3xl" />
           </div>
           <div>
-            <h2 className="text-white font-bold text-xl mb-1">
-              Payment Confirmed
-            </h2>
+            <h2 className="text-white font-bold text-xl mb-1">Payment Confirmed</h2>
             <p className="text-white/40 text-sm">
-              {status === "publishing"
-                ? publishingLabel
-                : "Bid recorded. Returning to piece…"}
+              {status === "publishing" ? publishingLabel : "Bid recorded. Returning to piece…"}
             </p>
           </div>
           <div className="border border-white/10 rounded px-4 py-2 text-sm">
             <span className="text-white/60">{bidderName}</span>
             <span className="text-white/20 mx-2">·</span>
-            <span className="text-green-400 font-semibold">
-              {formatSats(submitAmt)} sats
-            </span>
+            <span className="text-green-400 font-semibold">{formatSats(submitAmt)} sats</span>
           </div>
         </div>
       </div>
@@ -422,21 +382,15 @@ const Payment = () => {
       <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
         <div className="flex justify-between items-start">
           <div>
-            <p className="text-white/30 text-xs uppercase tracking-widest mb-1">
-              {collectionName}
-            </p>
-            <h1 className="text-white font-semibold text-lg">
-              {piece.artifactName}
-            </h1>
+            <p className="text-white/30 text-xs uppercase tracking-widest mb-1">{collectionName}</p>
+            <h1 className="text-white font-semibold text-lg">{piece.artifactName}</h1>
             <p className="text-white/40 text-sm mt-1">
               Bidding as <span className="text-white/70">{bidderName}</span>
             </p>
           </div>
           <div className="flex flex-col items-end">
             <p className="text-white/20 text-xs mb-0.5">Time left</p>
-            <p
-              className={`font-mono font-bold text-lg tabular-nums ${timerColor}`}
-            >
+            <p className={`font-mono font-bold text-lg tabular-nums ${timerColor}`}>
               {timerLabel}
             </p>
           </div>
@@ -444,9 +398,7 @@ const Payment = () => {
 
         <div className="flex justify-between items-center bg-white/5 border border-white/10 rounded-lg px-4 py-3">
           <span className="text-white/40 text-sm">Deposit amount</span>
-          <span className="text-green-400 font-bold text-xl">
-            {formatSats(submitAmt)} sats
-          </span>
+          <span className="text-green-400 font-bold text-xl">{formatSats(submitAmt)} sats</span>
         </div>
 
         {invoice && (
@@ -459,21 +411,15 @@ const Payment = () => {
               className="flex items-center gap-2 text-white/40 hover:text-white text-sm transition-colors bg-transparent border-none cursor-pointer"
             >
               {copied ? (
-                <>
-                  <FiCheck className="text-green-400" /> Copied
-                </>
+                <><FiCheck className="text-green-400" /> Copied</>
               ) : (
-                <>
-                  <FiCopy /> Copy invoice
-                </>
+                <><FiCopy /> Copy invoice</>
               )}
             </button>
           </div>
         )}
 
-        <p className="text-white/20 text-xs text-center animate-pulse">
-          Waiting for payment…
-        </p>
+        <p className="text-white/20 text-xs text-center animate-pulse">Waiting for payment…</p>
 
         <div className="flex flex-col gap-2">
           <button
