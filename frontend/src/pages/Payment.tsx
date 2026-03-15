@@ -128,6 +128,14 @@ const Payment = () => {
     confirmZap,
   ]);
 
+  // Stable ref so NWC polling never needs handlePaymentConfirmed in its deps.
+  // Without this, any re-render that gives handlePaymentConfirmed a new reference
+  // would cancel and restart the poll, breaking confirmation.
+  const handlePaymentConfirmedRef = useRef(handlePaymentConfirmed);
+  useEffect(() => {
+    handlePaymentConfirmedRef.current = handlePaymentConfirmed;
+  }, [handlePaymentConfirmed]);
+
   // Generate invoice on mount
   useEffect(() => {
     const generate = async () => {
@@ -157,35 +165,59 @@ const Payment = () => {
   }, []);
 
   // NWC polling — primary confirmation method when creator has NWC configured.
-  // Runs only if: invoice is ready, we have a payment_hash, and status is waiting.
-  // If NWC is not configured or probe fails, falls through silently to zap fallback.
+  // Deps intentionally exclude handlePaymentConfirmed — we use the ref instead
+  // so the effect never restarts mid-poll due to callback identity changes.
   useEffect(() => {
+    console.log("[NWC] effect run", { paymentHash, status, lightningAddress });
     if (!paymentHash || status !== "waiting") return;
 
     const nwcString = getLatestNWC(lightningAddress);
-    if (!nwcString) return;
+    if (!nwcString) {
+      console.log(
+        "[NWC] no NWC configured for",
+        lightningAddress,
+        "— zap fallback active",
+      );
+      return;
+    }
 
     let cancelPoll: (() => void) | null = null;
 
     const start = async () => {
       try {
         const config = parseNWCString(nwcString);
+        console.log("[NWC] polling started", {
+          relay: config.relayUrl,
+          paymentHash,
+        });
         cancelPoll = pollInvoiceSettlement(
           config,
           paymentHash,
-          handlePaymentConfirmed,
+          () => {
+            console.log("[NWC] payment settled — confirming bid");
+            handlePaymentConfirmedRef.current();
+          },
           { intervalMs: 3_000, timeoutMs: TIMER_SECONDS * 1000 },
         );
       } catch (e) {
-        console.warn("NWC setup failed, using zap fallback:", e);
+        console.warn("[NWC] setup failed — zap fallback active:", e);
       }
     };
 
     start();
-    return () => cancelPoll?.();
-  }, [paymentHash, status, lightningAddress, handlePaymentConfirmed]);
+    return () => {
+      console.log("[NWC] effect cleanup", {
+        paymentHash,
+        status,
+        lightningAddress,
+      });
+      console.log("[NWC] polling stopped");
 
-  // Zap receipt monitor — fallback when NWC is not configured or probe fails.
+      cancelPoll?.();
+    };
+  }, [paymentHash, status, lightningAddress]);
+
+  // Zap receipt monitor — fallback when NWC is not configured or fails.
   // handledRef ensures it never double-fires with NWC.
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
