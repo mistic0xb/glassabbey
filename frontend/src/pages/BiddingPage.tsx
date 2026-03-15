@@ -206,13 +206,6 @@ const BiddingPage = () => {
 
   return (
     <div className="min-h-screen px-4 sm:px-6 py-8 max-w-5xl mx-auto">
-      <button
-        onClick={() => navigate(-1)}
-        className="text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
-      >
-        ← Back
-      </button>
-
       <div className="grid grid-cols-1 lg:grid-cols-[55%_45%] gap-6 items-start">
         {/* LEFT */}
         <div className="flex flex-col gap-4">
