@@ -9,20 +9,23 @@ import {
   FiAlertTriangle,
 } from "react-icons/fi";
 import { generatePieceInvoice, monitorZapPayment } from "../libs/nostr/nip57";
-import { publishBid } from "../libs/nostr/bid";
+import { createSignedBid, publishSignedBid } from "../libs/nostr/bid";
+import type { Event } from "nostr-tools";
 import { useAuction } from "../libs/useAuction";
-import type { Piece } from "../types/types";
+import type { Piece, Collection } from "../types/types";
 
 const WS_URL = import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080";
 
 interface PaymentState {
   piece: Piece;
+  collection: Collection;
   collectionName: string;
   lightningAddress: string;
   recipientPubkey: string;
   willingAmt: number;
   submitAmt: number;
   bidderName: string;
+  lockToken: string;
 }
 
 const formatSats = (n: number): string =>
@@ -32,6 +35,7 @@ const TIMER_SECONDS = 120;
 const PUBLISH_MAX_RETRIES = 3;
 const PUBLISH_RETRY_DELAY_MS = 2000;
 
+// Sign once, retry publishing the same event — prevents duplicate relay entries
 async function publishBidWithRetry(
   pieceId: string,
   willingAmt: number,
@@ -39,10 +43,13 @@ async function publishBidWithRetry(
   bidderName: string,
   onAttempt?: (attempt: number) => void,
 ): Promise<void> {
+  // Create and sign the event exactly once
+  const signedEvent: Event = createSignedBid(pieceId, willingAmt, submitAmt, bidderName);
+
   for (let attempt = 1; attempt <= PUBLISH_MAX_RETRIES; attempt++) {
     try {
       onAttempt?.(attempt);
-      await publishBid(pieceId, willingAmt, submitAmt, bidderName);
+      await publishSignedBid(signedEvent); // same event every retry
       return;
     } catch (err) {
       console.error(`publishBid attempt ${attempt} failed:`, err);
@@ -69,7 +76,6 @@ const Payment = () => {
   const [publishAttempt, setPublishAttempt] = useState(0);
   const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
 
-  // Guards against double-processing from NWC notification + zap receipt firing simultaneously
   const handledRef = useRef(false);
 
   if (!state) {
@@ -79,23 +85,32 @@ const Payment = () => {
 
   const {
     piece,
+    collection,
     collectionName,
     lightningAddress,
     recipientPubkey,
     willingAmt,
     submitAmt,
     bidderName,
+    lockToken,
   } = state;
 
-  // useAuction gives us access to the shared WS and auction state
-  const { cancelBid, confirmZap, state: auctionState } = useAuction(piece.id);
+  const { cancelBid, confirmZap, checkPayment, setPaymentCallbacks, state: auctionState } =
+    useAuction(piece.id);
+
+  const goBackToCollection = useCallback(() => {
+    const slug = collectionName
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9-]/g, "");
+    navigate(`/explore/${slug}/${collection.id}`, { state: collection });
+  }, [collection, collectionName, navigate]);
 
   const handlePaymentConfirmed = useCallback(async () => {
     if (handledRef.current) return;
     handledRef.current = true;
     setStatus("publishing");
 
-    // Server already updated currentPrice — just publish to Nostr
     try {
       await publishBidWithRetry(
         piece.id,
@@ -111,33 +126,43 @@ const Payment = () => {
       return;
     }
 
-    setTimeout(
-      () => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } }),
-      3000,
-    );
-  }, [piece, willingAmt, submitAmt, bidderName, collectionName, navigate]);
+    setTimeout(() => goBackToCollection(), 3000);
+  }, [piece, willingAmt, submitAmt, bidderName, goBackToCollection]);
 
-  // Watch for NEW_BID with our willingAmt — this is how server signals our payment confirmed.
-  // Server broadcasts NEW_BID after both NWC notification AND ZAP_CONFIRMED paths.
-  // Using willingAmt match means we only react to our own bid, not others'.
+  // Register callbacks for CHECK_PAYMENT server responses
+  useEffect(() => {
+    setPaymentCallbacks(
+      (confirmedWillingAmt) => {
+        if (confirmedWillingAmt === willingAmt) {
+          console.log("[Payment] Server: payment already confirmed while backgrounded");
+          handlePaymentConfirmed();
+        }
+      },
+      (activeWillingAmt) => {
+        if (activeWillingAmt === willingAmt) {
+          console.log("[Payment] Server: lock still active, continuing to wait");
+        }
+      },
+    );
+  }, [willingAmt, handlePaymentConfirmed, setPaymentCallbacks]);
+
+  // Watch for NEW_BID matching our willingAmt — server signals payment confirmed
   useEffect(() => {
     if (status !== "waiting") return;
-    if (auctionState.status === "idle" &&
-        auctionState.currentHighestBid > 0 &&
-        // NEW_BID for our willingAmt means our payment was confirmed by server
-        auctionState.wonDetails === null) {
-      // Check if the currentHighestBid corresponds to our bid being confirmed.
-      // Server sets currentPrice = currentPrice + bidAmt - submitAmt after our bid.
-      // willingAmt - submitAmt = the new currentPrice after our bid.
+    if (
+      auctionState.status === "idle" &&
+      auctionState.currentHighestBid > 0 &&
+      auctionState.wonDetails === null
+    ) {
       const expectedNewPrice = willingAmt - submitAmt;
       if (auctionState.currentHighestBid === expectedNewPrice) {
-        console.log("[Payment] NEW_BID matches our willingAmt — payment confirmed by server");
+        console.log("[Payment] NEW_BID matches — payment confirmed by server");
         handlePaymentConfirmed();
       }
     }
   }, [auctionState.status, auctionState.currentHighestBid, status, willingAmt, submitAmt, handlePaymentConfirmed]);
 
-  // Generate invoice on mount, then send START_PAYMENT to server
+  // Generate invoice on mount, send START_PAYMENT to server
   useEffect(() => {
     const generate = async () => {
       setGenerating(true);
@@ -154,9 +179,7 @@ const Payment = () => {
         setZapRequestId(result.zapRequestId);
         setStatus("waiting");
 
-        // Tell server to start NWC notification subscription
         if (result.paymentHash) {
-          console.log("[Payment] Sending START_PAYMENT to server, paymentHash=", result.paymentHash);
           const ws = new WebSocket(`${WS_URL}?pieceId=${piece.id}`);
           ws.onopen = () => {
             ws.send(JSON.stringify({
@@ -168,7 +191,7 @@ const Payment = () => {
           };
           ws.onerror = () => ws.close();
         } else {
-          console.warn("[Payment] No paymentHash extracted from bolt11 — NWC unavailable, zap fallback only");
+          console.warn("[Payment] No paymentHash — NWC unavailable, zap fallback only");
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to generate invoice");
@@ -179,39 +202,42 @@ const Payment = () => {
     generate();
   }, []);
 
-  // Zap receipt monitor — client-side fallback.
-  // If server NWC notification fires first, handledRef prevents double-processing.
-  // If zap fires first, it calls confirmZap() which sends ZAP_CONFIRMED to server,
-  // server calls confirmPayment() which updates price + broadcasts NEW_BID.
+  // Zap receipt monitor — client-side fallback
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
     const unsubscribe = monitorZapPayment(
       recipientPubkey,
       zapRequestId,
       () => {
-        console.log("[Payment] Zap receipt detected — sending ZAP_CONFIRMED to server");
-        // Send ZAP_CONFIRMED to server — server handles price update + NEW_BID broadcast
+        console.log("[Payment] Zap receipt detected — sending ZAP_CONFIRMED");
         confirmZap();
-        // handlePaymentConfirmed will be triggered by the NEW_BID watch above
-        // but also call it directly as belt-and-suspenders in case WS is slow
         handlePaymentConfirmed();
       },
     );
     return () => unsubscribe();
   }, [invoice, zapRequestId, status, handlePaymentConfirmed, confirmZap]);
 
-  // Recheck on focus/visibility — mobile wallet returns to browser
+  // On focus/visibility — mobile user returned from wallet app
   useEffect(() => {
     if (status !== "waiting") return;
-    const recheckOnFocus = () => {
-      if (handledRef.current || !zapRequestId) return;
+
+    const onReturn = () => {
+      if (handledRef.current) return;
+
+      console.log("[Payment] Browser returned to foreground — checking payment status");
+
+      // Ask server if payment was confirmed while backgrounded
+      checkPayment(lockToken, willingAmt);
+
+      // Also recheck zap receipts as fallback
+      if (!zapRequestId) return;
       const since = Math.floor(Date.now() / 1000) - 10 * 60;
       const unsub = monitorZapPayment(
         recipientPubkey,
         zapRequestId,
         () => {
           unsub();
-          console.log("[Payment] Zap recheck detected payment — sending ZAP_CONFIRMED");
+          console.log("[Payment] Zap recheck detected payment");
           confirmZap();
           handlePaymentConfirmed();
         },
@@ -219,16 +245,18 @@ const Payment = () => {
       );
       setTimeout(() => unsub(), 10_000);
     };
+
     const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") recheckOnFocus();
+      if (document.visibilityState === "visible") onReturn();
     };
+
     document.addEventListener("visibilitychange", onVisibilityChange);
-    window.addEventListener("focus", recheckOnFocus);
+    window.addEventListener("focus", onReturn);
     return () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
-      window.removeEventListener("focus", recheckOnFocus);
+      window.removeEventListener("focus", onReturn);
     };
-  }, [status, zapRequestId, recipientPubkey, handlePaymentConfirmed, confirmZap]);
+  }, [status, zapRequestId, recipientPubkey, lockToken, willingAmt, handlePaymentConfirmed, confirmZap, checkPayment]);
 
   // 2-minute countdown
   useEffect(() => {
@@ -239,8 +267,8 @@ const Payment = () => {
         if (t <= 1) {
           clearInterval(interval);
           if (!handledRef.current) {
-            cancelBid();
-            navigate(-1);
+            cancelBid(lockToken);
+            goBackToCollection();
           }
           return 0;
         }
@@ -282,8 +310,8 @@ const Payment = () => {
   };
 
   const handleCancel = () => {
-    cancelBid();
-    navigate(-1);
+    cancelBid(lockToken);
+    goBackToCollection();
   };
 
   const timerColor =
@@ -316,10 +344,10 @@ const Payment = () => {
             <p className="text-white/30">Piece ID: <span className="text-white/60 font-mono break-all">{piece.id}</span></p>
           </div>
           <button
-            onClick={() => navigate(`/piece/${piece.id}`, { state: { piece, collectionName } })}
+            onClick={goBackToCollection}
             className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer"
           >
-            Return to piece
+            Return to collection
           </button>
         </div>
       </div>
@@ -340,7 +368,7 @@ const Payment = () => {
           <div>
             <h2 className="text-white font-bold text-xl mb-1">Payment Confirmed</h2>
             <p className="text-white/40 text-sm">
-              {status === "publishing" ? publishingLabel : "Bid recorded. Returning to piece…"}
+              {status === "publishing" ? publishingLabel : "Bid recorded. Returning to collection…"}
             </p>
           </div>
           <div className="border border-white/10 rounded px-4 py-2 text-sm">
@@ -380,6 +408,14 @@ const Payment = () => {
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
+
+        <button
+          onClick={goBackToCollection}
+          className="flex items-center gap-1.5 text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer self-start"
+        >
+          <FiArrowLeft size={12} /> {collectionName}
+        </button>
+
         <div className="flex justify-between items-start">
           <div>
             <p className="text-white/30 text-xs uppercase tracking-widest mb-1">{collectionName}</p>

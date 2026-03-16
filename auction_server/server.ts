@@ -7,6 +7,7 @@ import * as nip04 from "nostr-tools/nip04";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "crypto";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8080;
 const LOCK_TIMEOUT_MS = 2 * 60 * 1000;
@@ -17,9 +18,12 @@ const BIDS_FILE = path.join(process.cwd(), "bids.json");
 
 const RELAYS = [
     "wss://relay.damus.io",
-    "wss://relay.nostr.band",
     "wss://nos.lol",
+    "wss://nostr.mom",
+    "wss://relay.angor.io/",
 ];
+
+// ─── bids.json ────────────────────────────────────────────────────────────────
 
 interface BidRecord {
     currentPrice: number;
@@ -54,6 +58,8 @@ function getStoredPrice(pieceId: string): number | null {
     return store[pieceId]?.currentPrice ?? null;
 }
 
+// ─── nwc.json ─────────────────────────────────────────────────────────────────
+
 function readNWCStore(): Record<string, string> {
     try {
         if (!fs.existsSync(NWC_FILE)) return {};
@@ -83,7 +89,7 @@ function getNWC(lightningAddress: string): string | null {
     return store[lightningAddress.toLowerCase().trim()] ?? null;
 }
 
-// NWC client 
+// ─── NWC client ───────────────────────────────────────────────────────────────
 
 interface NWCConfig {
     walletPubkey: string;
@@ -116,7 +122,7 @@ async function nwcDecrypt(config: NWCConfig, ciphertext: string): Promise<string
     }
 }
 
-// ─── Nostr rehydration — fallback only if bids.json has no entry ──────────────
+// ─── Nostr rehydration ────────────────────────────────────────────────────────
 
 const pieceBidTag = (pieceId: string) => `glassabbey-bid:${pieceId}`;
 
@@ -165,9 +171,8 @@ async function fetchPriceFromNostr(pieceId: string): Promise<number> {
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Lock {
-    // ws is only used to send BID_WON — after that it's not needed.
-    // The lock itself survives socket disconnects (mobile goes to wallet app).
     ws: WebSocket;
+    lockToken: string;   // UUID sent to winning bidder — used for cancel identity
     bidderName: string;
     bidAmt: number;
     submitAmt: number;
@@ -197,10 +202,16 @@ interface PieceState {
 }
 
 interface SubmitBidMessage { type: "SUBMIT_BID"; bidderName: string; bidAmt: number; submitAmt: number; }
-interface CancelBidMessage { type: "CANCEL_BID"; }
+interface CancelBidMessage { type: "CANCEL_BID"; lockToken: string; }
 interface ZapConfirmedMessage { type: "ZAP_CONFIRMED"; }
 interface StartPaymentMessage { type: "START_PAYMENT"; paymentHash: string; lightningAddress: string; }
-type ClientMessage = SubmitBidMessage | CancelBidMessage | ZapConfirmedMessage | StartPaymentMessage;
+interface CheckPaymentMessage { type: "CHECK_PAYMENT"; lockToken: string; willingAmt: number; }
+type ClientMessage =
+    | SubmitBidMessage
+    | CancelBidMessage
+    | ZapConfirmedMessage
+    | StartPaymentMessage
+    | CheckPaymentMessage;
 
 // ─── Piece state ──────────────────────────────────────────────────────────────
 
@@ -243,24 +254,42 @@ function clearLock(piece: PieceState, pieceId: string, reason = "LOCK_EXPIRED"):
 }
 
 function sendState(ws: WebSocket, piece: PieceState): void {
-    send(ws, { type: "STATE", currentPrice: piece.currentPrice, locked: !!piece.lock });
+    send(ws, {
+        type: "STATE",
+        currentPrice: piece.currentPrice,
+        locked: !!piece.lock,
+        // Expose the current lock's willingAmt publicly so reconnecting
+        // Payment.tsx can identify if its bid is still the active lock
+        lockWillingAmt: piece.lock?.willingAmt ?? null,
+    });
 }
 
-function tryAcquireLock(piece: PieceState, pieceId: string, ws: WebSocket, bidderName: string, bidAmt: number, submitAmt: number): void {
+function tryAcquireLock(
+    piece: PieceState,
+    pieceId: string,
+    ws: WebSocket,
+    bidderName: string,
+    bidAmt: number,
+    submitAmt: number,
+): void {
     if (bidAmt <= 0) { send(ws, { type: "BID_REJECTED", reason: "Bid increment must be positive" }); return; }
     if (submitAmt > bidAmt) { send(ws, { type: "BID_REJECTED", reason: "Submit cannot exceed bid increment" }); return; }
     if (piece.lock) { send(ws, { type: "BID_QUEUED", reason: "Someone else is currently completing a payment, please wait" }); return; }
 
     const willingAmt = piece.currentPrice + bidAmt;
+    const lockToken = randomUUID();
+
     const timer = setTimeout(() => {
         console.log(`[${pieceId}] Lock timed out for ${piece.lock?.bidderName ?? bidderName}`);
         stopNWCSub(piece, pieceId);
         clearLock(piece, pieceId, "LOCK_EXPIRED");
     }, LOCK_TIMEOUT_MS);
 
-    piece.lock = { ws, bidderName, bidAmt, submitAmt, willingAmt, timer };
-    console.log(`[${pieceId}] Lock acquired by ${bidderName}: bidAmt=${bidAmt}, submitAmt=${submitAmt}, willingAmt=${willingAmt}`);
-    send(ws, { type: "BID_WON", willingAmt, submitAmt, bidderName });
+    piece.lock = { ws, lockToken, bidderName, bidAmt, submitAmt, willingAmt, timer };
+    console.log(`[${pieceId}] Lock acquired by ${bidderName}: bidAmt=${bidAmt}, submitAmt=${submitAmt}, willingAmt=${willingAmt}, lockToken=${lockToken}`);
+
+    // Send lockToken only to the winning bidder — no one else ever sees it
+    send(ws, { type: "BID_WON", willingAmt, submitAmt, bidderName, lockToken });
     broadcast(piece, { type: "BID_LOCKED", reason: "A bidder is completing payment, please wait" }, ws);
 }
 
@@ -317,7 +346,12 @@ function stopNWCSub(piece: PieceState, pieceId: string): void {
     console.log(`[${pieceId}] NWC subscription stopped`);
 }
 
-function startNWCSub(piece: PieceState, pieceId: string, paymentHash: string, lightningAddress: string): void {
+function startNWCSub(
+    piece: PieceState,
+    pieceId: string,
+    paymentHash: string,
+    lightningAddress: string,
+): void {
     stopNWCSub(piece, pieceId);
 
     const nwcString = getNWC(lightningAddress);
@@ -460,7 +494,6 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
         return;
     }
 
-    // ── Normal auction endpoint: ?pieceId=... ──
     if (!pieceId) { ws.close(1008, "Missing pieceId"); return; }
 
     const piece = getPiece(pieceId);
@@ -516,12 +549,19 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                 break;
             }
             case "CANCEL_BID": {
-                // Only cancel if this socket is the lock holder — prevents other
-                // clients from cancelling someone else's active payment
-                if (piece.lock?.ws === ws) {
-                    console.log(`[${pieceId}] Lock cancelled by ${piece.lock.bidderName}`);
+                // Match by lockToken — unguessable UUID known only to the winning bidder.
+                // Safe across reconnects: even a new socket can cancel if it has the token.
+                const { lockToken } = msg;
+                if (!lockToken) {
+                    send(ws, { type: "ERROR", reason: "Missing lockToken" });
+                    return;
+                }
+                if (piece.lock?.lockToken === lockToken) {
+                    console.log(`[${pieceId}] Lock cancelled by token — bidder: ${piece.lock.bidderName}`);
                     stopNWCSub(piece, pieceId);
                     clearLock(piece, pieceId, "LOCK_EXPIRED");
+                } else {
+                    console.log(`[${pieceId}] CANCEL_BID with wrong or stale lockToken — ignoring`);
                 }
                 break;
             }
@@ -540,10 +580,38 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                     console.log(`[${pieceId}] ZAP_CONFIRMED — no lock held, ignoring`);
                     return;
                 }
-                if (piece.lock.ws !== ws) {
-                    console.log(`[${pieceId}] ZAP_CONFIRMED from non-lock socket — accepting (mobile reconnect path)`);
-                }
+                console.log(`[${pieceId}] ZAP_CONFIRMED received`);
                 confirmPayment(piece, pieceId, "zap");
+                break;
+            }
+            case "CHECK_PAYMENT": {
+                // Client reconnected after going to wallet app — check if their payment
+                // was already confirmed while they were backgrounded.
+                const { lockToken, willingAmt } = msg;
+                if (!lockToken || !willingAmt) {
+                    send(ws, { type: "ERROR", reason: "Missing lockToken or willingAmt" });
+                    return;
+                }
+
+                console.log(`[${pieceId}] CHECK_PAYMENT — lockToken=${lockToken}, willingAmt=${willingAmt}`);
+
+                // Case 1: payment was already confirmed — lastConfirmedWillingAmt matches
+                if (piece.lastConfirmedWillingAmt === willingAmt) {
+                    console.log(`[${pieceId}] CHECK_PAYMENT — already confirmed, notifying client`);
+                    send(ws, { type: "PAYMENT_ALREADY_CONFIRMED", willingAmt });
+                    return;
+                }
+
+                // Case 2: lock is still active and this client is the lock holder
+                if (piece.lock?.lockToken === lockToken) {
+                    console.log(`[${pieceId}] CHECK_PAYMENT — lock still active, client is lock holder`);
+                    send(ws, { type: "LOCK_STILL_ACTIVE", willingAmt, submitAmt: piece.lock.submitAmt });
+                    return;
+                }
+
+                // Case 3: lock expired without confirmation (payment failed or timed out)
+                console.log(`[${pieceId}] CHECK_PAYMENT — lock expired, no confirmation found`);
+                send(ws, { type: "PAYMENT_NOT_FOUND" });
                 break;
             }
             default:
@@ -555,19 +623,12 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
         piece.clients.delete(ws);
         console.log(`[${pieceId}] Client disconnected (${piece.clients.size} remaining)`);
 
-        // Do NOT release the lock when the lock holder disconnects.
-        // On mobile, the user leaves the browser to open their wallet app —
-        // this kills the WebSocket, but the payment may already be in flight
-        // or completed. The lock and NWC subscription must survive this.
-        // The 2-minute timer in tryAcquireLock handles the actual timeout.
-        // Only CANCEL_BID, ZAP_CONFIRMED, and NWC payment_received clear the lock.
+        // Do NOT release lock on disconnect — mobile users leave browser to open
+        // wallet app. Lock survives; 2-minute timer is the only expiry.
         if (piece.lock?.ws === ws) {
             console.log(`[${pieceId}] Lock holder disconnected — lock kept alive (mobile payment in progress)`);
         }
 
-        // Only schedule cleanup if there's no active lock.
-        // If a lock is active, the piece must stay alive to receive
-        // ZAP_CONFIRMED when the user returns, or NWC notification from server.
         if (piece.clients.size === 0 && !piece.lock) {
             piece.cleanupTimer = setTimeout(() => {
                 if (piece.clients.size === 0 && !piece.lock) {

@@ -56,9 +56,8 @@ const BiddingPage = () => {
 
   const displayName = bidderName.trim().toLowerCase();
 
-  // currentPrice from server = the live running price (source of truth)
   const { state: auction, submitBid } = useAuction(id ?? "");
-  const currentPrice = auction.currentHighestBid; // server sends this as currentPrice
+  const currentPrice = auction.currentHighestBid;
 
   useEffect(() => {
     if (!id) return;
@@ -100,14 +99,13 @@ const BiddingPage = () => {
     return () => window.removeEventListener("focus", fetchBids);
   }, [fetchBids]);
 
-  // Refetch nostr bids whenever server confirms a new bid
   useEffect(() => {
     if (auction.status === "idle" && auction.currentHighestBid > 0) {
       fetchBids();
     }
   }, [auction.currentHighestBid]);
 
-  // Navigate to payment when server grants the bid slot
+  // Navigate to payment — pass lockToken so Payment.tsx can cancel and verify
   useEffect(() => {
     if (
       auction.status !== "won" ||
@@ -120,6 +118,7 @@ const BiddingPage = () => {
       finalBidAmt: willingAmt,
       submitAmt: wonSubmitAmt,
       bidderName: wonBidderName,
+      lockToken,
     } = auction.wonDetails;
     const slug = piece.artifactName
       .toLowerCase()
@@ -128,12 +127,14 @@ const BiddingPage = () => {
     navigate(`/payment/${slug}/${piece.id}`, {
       state: {
         piece,
+        collection,
         collectionName: collection.name,
         lightningAddress: collection.lightningAddress,
         recipientPubkey: collection.pubkey,
-        willingAmt, // = currentPrice + bidAmt, stored on nostr
+        willingAmt,
         submitAmt: wonSubmitAmt,
         bidderName: wonBidderName,
+        lockToken, // passed through so Payment.tsx can cancel/verify by token
       },
     });
   }, [auction.status, auction.wonDetails, piece, collection]);
@@ -145,7 +146,6 @@ const BiddingPage = () => {
 
   const topBidder = sortedBids[0] ?? null;
 
-  // Each bid's price = willingAmt - submitAmt (self-contained, no cumulative needed)
   const bidsWithPrice = useMemo(
     () =>
       sortedBids.map((bid) => ({
@@ -155,13 +155,11 @@ const BiddingPage = () => {
     [sortedBids],
   );
 
-  // If bidAmt selected, new price after this bid = currentPrice + bidAmt - submitAmt
   const previewPrice =
     bidAmt !== null && submitAmt !== null
       ? currentPrice + bidAmt - submitAmt
       : null;
 
-  // willingAmt sent to nostr = currentPrice + bidAmt
   const willingAmt = bidAmt !== null ? currentPrice + bidAmt : null;
 
   const handleBidAmtSelect = (amt: number) => {
@@ -206,13 +204,19 @@ const BiddingPage = () => {
 
   return (
     <div className="min-h-screen px-4 sm:px-6 py-8 max-w-5xl mx-auto">
+      <button
+        onClick={() => navigate(-1)}
+        className="text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
+      >
+        ← Back
+      </button>
+
       <div className="grid grid-cols-1 lg:grid-cols-[55%_45%] gap-6 items-start">
         {/* LEFT */}
         <div className="flex flex-col gap-4">
           <div className="rounded-lg overflow-hidden border border-white/10">
             <div className="rounded-lg overflow-hidden border border-white/10">
               <div className="h-84 sm:h-96 relative">
-                {/* blurred background */}
                 <img
                   src={
                     piece.imageUrl ||
@@ -221,8 +225,6 @@ const BiddingPage = () => {
                   className="absolute inset-0 w-full h-full object-cover blur-xl scale-110 opacity-40"
                   alt=""
                 />
-
-                {/* main image */}
                 <img
                   src={
                     piece.imageUrl ||
@@ -263,7 +265,6 @@ const BiddingPage = () => {
             </div>
           </div>
 
-          {/* Current Price */}
           <div className="border border-white/10 rounded-lg p-4 bg-white/2">
             <p className="text-white/30 text-xs uppercase tracking-widest mb-2">
               Current Price
@@ -276,7 +277,6 @@ const BiddingPage = () => {
             </p>
           </div>
 
-          {/* Top bidder */}
           {topBidder && (
             <div className="border border-yellow-500/20 bg-yellow-500/5 rounded-lg px-4 py-3 flex justify-between items-center">
               <div>

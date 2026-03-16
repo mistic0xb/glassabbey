@@ -68,37 +68,57 @@ export async function fetchBidsForPiece(pieceId: string): Promise<Bid[]> {
   });
 }
 
-export async function publishBid(
+// Sign the bid event once and return it — callers can retry publishing
+// the same signed event without creating duplicate relay entries.
+export function createSignedBid(
   pieceId: string,
   willingAmt: number,
   submitAmt: number,
   bidderName?: string,
-): Promise<string> {
+): Event {
   const sk = generateSecretKey();
   const pk = getPublicKey(sk);
-
   const eventTemplate = {
     kind: 30078,
     created_at: Math.floor(Date.now() / 1000),
     tags: [
-      ["d", `bid-${pieceId}-${Date.now()}`],
+      // Use a stable d-tag derived from the bid's unique identity (willingAmt + pieceId).
+      // This makes it a replaceable event — if the same bid is published twice,
+      // the relay deduplicates by (pubkey, kind, d-tag). Since we generate a fresh
+      // keypair per bid, the pubkey is already unique, but the stable d-tag prevents
+      // different retry attempts from creating duplicate entries.
+      ["d", `bid-${pieceId}-${willingAmt}`],
       ["t", "glassabbey-bid"],
       ["t", pieceBidTag(pieceId)],
     ],
     content: JSON.stringify({ willingAmt, submitAmt, bidderName }),
     pubkey: pk,
   };
+  return finalizeEvent(eventTemplate, sk);
+}
 
-  const signed = finalizeEvent(eventTemplate, sk);
+// Publish a pre-signed bid event to relays.
+// Accepts an already-signed event so retries re-publish the same event
+// rather than creating new ones.
+export async function publishSignedBid(signedEvent: Event): Promise<void> {
   const pool = getPool();
-  const pubs = pool.publish(DEFAULT_RELAYS, signed);
-
+  const pubs = pool.publish(DEFAULT_RELAYS, signedEvent);
   await Promise.race([
-    Promise.all(pubs),
+    Promise.any(pubs),
     new Promise((r) => setTimeout(r, 5000)),
   ]);
+}
 
-  return pk;
+// Convenience function for single-shot publish (backward compat).
+export async function publishBid(
+  pieceId: string,
+  willingAmt: number,
+  submitAmt: number,
+  bidderName?: string,
+): Promise<string> {
+  const signed = createSignedBid(pieceId, willingAmt, submitAmt, bidderName);
+  await publishSignedBid(signed);
+  return signed.pubkey;
 }
 
 function sortBids(bids: Bid[]): Bid[] {
