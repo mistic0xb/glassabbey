@@ -31,7 +31,7 @@ interface PaymentState {
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
-const TIMER_SECONDS = 120;
+const TIMER_SECONDS = 60;
 const PUBLISH_MAX_RETRIES = 3;
 const PUBLISH_RETRY_DELAY_MS = 2000;
 
@@ -253,7 +253,7 @@ const Payment = () => {
     };
   }, [status, zapRequestId, recipientPubkey, lockToken, willingAmt, handlePaymentConfirmed, confirmZap, checkPayment]);
 
-  // 2-minute countdown
+  // 1-minute countdown
   useEffect(() => {
     if (status !== "waiting") return;
     setTimeLeft(TIMER_SECONDS);
