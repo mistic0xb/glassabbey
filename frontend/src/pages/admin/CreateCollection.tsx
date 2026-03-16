@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { useNavigate } from "react-router";
 import { v4 as uuidv4 } from "uuid";
 import { validateNWCString } from "../../libs/nwc/nwc";
+import { uploadToBlossom } from "../../libs/nostr/blossom";
 
 const WS_URL = import.meta.env.VITE_AUCTION_WS_URL || "ws://localhost:8080";
 
@@ -41,8 +42,6 @@ const Field = ({
   </div>
 );
 
-// Send NWC string to server via a short-lived WS connection.
-// Fire-and-forget — errors are non-fatal, collection creation proceeds either way.
 function registerNWC(lightningAddress: string, nwcString: string): void {
   try {
     const ws = new WebSocket(`${WS_URL}?action=register`);
@@ -82,6 +81,12 @@ const CreateCollection = () => {
   const [bannerUrl, setBannerUrl] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  const [uploadState, setUploadState] = useState<
+    "idle" | "uploading" | "done" | "error"
+  >("idle");
+  const [uploadError, setUploadError] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const handleNwcChange = (v: string) => {
     setNwcString(v);
     if (!v.trim()) {
@@ -90,6 +95,28 @@ const CreateCollection = () => {
     }
     const err = validateNWCString(v.trim());
     setErrors((p) => ({ ...p, nwc: err ?? "" }));
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Reset
+    setUploadError("");
+    setBannerUrl("");
+    setUploadState("uploading");
+
+    try {
+      const url = await uploadToBlossom(file);
+      setBannerUrl(url);
+      setUploadState("done");
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : "Upload failed");
+      setUploadState("error");
+    } finally {
+      // Clear file input so same file can be re-selected if needed
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
   };
 
   const handleNext = () => {
@@ -105,7 +132,6 @@ const CreateCollection = () => {
       return;
     }
 
-    // Register NWC on server — fire and forget, non-blocking
     if (nwcString.trim() && !errors.nwc) {
       registerNWC(lightningAddress.trim(), nwcString.trim());
     }
@@ -166,7 +192,7 @@ const CreateCollection = () => {
 
           <div className="border-t border-white/10" />
 
-          {/* NWC — optional, enables server-side payment confirmation */}
+          {/* NWC */}
           <div className="flex flex-col gap-1">
             <label className="text-xs text-white/40 uppercase tracking-widest">
               Wallet Connect (NWC)
@@ -208,26 +234,112 @@ const CreateCollection = () => {
             placeholder="Brooklyn, NY"
           />
 
-          <Field
-            label="Banner Image URL"
-            value={bannerUrl}
-            type="url"
-            onChange={setBannerUrl}
-            placeholder="https://…"
-          />
+          {/* Banner Image — URL + Upload */}
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-white/40 uppercase tracking-widest">
+              Banner Image
+              <span className="text-white/20 ml-1">(optional)</span>
+            </label>
 
+            {/* URL input row */}
+            <div className="flex gap-2">
+              <input
+                type="url"
+                value={bannerUrl}
+                placeholder="https://…"
+                onChange={(e) => {
+                  setBannerUrl(e.target.value);
+                  setUploadState("idle");
+                  setUploadError("");
+                }}
+                className="flex-1 bg-white/5 border border-white/10 outline-none text-white text-sm px-3 py-2 rounded transition-colors placeholder:text-white/20 focus:border-white/30"
+              />
+
+              {/* Hidden file input */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={handleFileUpload}
+              />
+
+              {/* Upload button */}
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploadState === "uploading"}
+                className="px-3 py-2 text-xs font-medium rounded border border-white/10 bg-white/5 text-white/60 hover:text-white hover:border-white/30 hover:bg-white/10 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+              >
+                {uploadState === "uploading" ? (
+                  <span className="flex items-center gap-1.5">
+                    <svg
+                      className="animate-spin h-3 w-3"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      />
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8v8H4z"
+                      />
+                    </svg>
+                    Uploading…
+                  </span>
+                ) : (
+                  "Upload"
+                )}
+              </button>
+            </div>
+
+            {/* Upload status messages */}
+            {uploadState === "done" && (
+              <p className="text-green-400/60 text-xs">
+                ✓ Uploaded successfully
+              </p>
+            )}
+            {uploadState === "error" && (
+              <p className="text-red-400 text-xs">{uploadError}</p>
+            )}
+          </div>
+
+          {/* Banner preview */}
           {bannerUrl && (
-            <div
-              className="h-24 rounded overflow-hidden border border-white/10 bg-cover bg-center"
-              style={{ backgroundImage: `url(${bannerUrl})` }}
-            />
+            <div className="relative group">
+              <div
+                className="h-24 rounded overflow-hidden border border-white/10 bg-cover bg-center"
+                style={{ backgroundImage: `url(${bannerUrl})` }}
+              />
+              {/* Clear button */}
+              <button
+                type="button"
+                onClick={() => {
+                  setBannerUrl("");
+                  setUploadState("idle");
+                  setUploadError("");
+                }}
+                className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-black/60 text-white/60 hover:text-white hover:bg-black/80 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer border-none"
+                title="Remove banner"
+              >
+                ✕
+              </button>
+            </div>
           )}
         </div>
 
         <div className="flex justify-end mt-6">
           <button
             onClick={handleNext}
-            className="px-6 py-2.5 bg-green-600 hover:bg-green-500 text-white text-sm font-medium rounded transition-colors border-none cursor-pointer"
+            disabled={uploadState === "uploading"}
+            className="px-6 py-2.5 bg-green-600 hover:bg-green-500 text-white text-sm font-medium rounded transition-colors border-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Add Pieces →
           </button>
