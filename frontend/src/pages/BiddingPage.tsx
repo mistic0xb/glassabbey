@@ -205,10 +205,20 @@ const BiddingPage = () => {
   return (
     <div className="min-h-screen px-4 sm:px-6 py-8 max-w-5xl mx-auto">
       <button
-        onClick={() => navigate(-1)}
-        className="text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
+        onClick={() =>
+          collection
+            ? navigate(
+                `/explore/${collection.name
+                  .toLowerCase()
+                  .replace(/\s+/g, "-")
+                  .replace(/[^a-z0-9-]/g, "")}/${collection.id}`,
+                { state: collection },
+              )
+            : navigate("/explore")
+        }
+        className="text-white/30 text-md hover:text-white transition-colors bg-transparent border-none cursor-pointer mb-8"
       >
-        ← Back
+        ◀ Back
       </button>
 
       <div className="grid grid-cols-1 lg:grid-cols-[55%_45%] gap-6 items-start">

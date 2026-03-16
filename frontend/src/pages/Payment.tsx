@@ -85,7 +85,6 @@ const Payment = () => {
 
   const {
     piece,
-    collection,
     collectionName,
     lightningAddress,
     recipientPubkey,
@@ -98,13 +97,9 @@ const Payment = () => {
   const { cancelBid, confirmZap, checkPayment, setPaymentCallbacks, state: auctionState } =
     useAuction(piece.id);
 
-  const goBackToCollection = useCallback(() => {
-    const slug = collectionName
-      .toLowerCase()
-      .replace(/\s+/g, "-")
-      .replace(/[^a-z0-9-]/g, "");
-    navigate(`/explore/${slug}/${collection.id}`, { state: collection });
-  }, [collection, collectionName, navigate]);
+  const goBackToPiece= useCallback(() => {
+  navigate(`/piece/${piece.id}`);
+}, [piece.id, navigate]);
 
   const handlePaymentConfirmed = useCallback(async () => {
     if (handledRef.current) return;
@@ -126,8 +121,8 @@ const Payment = () => {
       return;
     }
 
-    setTimeout(() => goBackToCollection(), 3000);
-  }, [piece, willingAmt, submitAmt, bidderName, goBackToCollection]);
+    setTimeout(() => goBackToPiece(), 3000);
+  }, [piece, willingAmt, submitAmt, bidderName, goBackToPiece]);
 
   // Register callbacks for CHECK_PAYMENT server responses
   useEffect(() => {
@@ -268,7 +263,7 @@ const Payment = () => {
           clearInterval(interval);
           if (!handledRef.current) {
             cancelBid(lockToken);
-            goBackToCollection();
+            goBackToPiece();
           }
           return 0;
         }
@@ -311,7 +306,7 @@ const Payment = () => {
 
   const handleCancel = () => {
     cancelBid(lockToken);
-    goBackToCollection();
+    goBackToPiece();
   };
 
   const timerColor =
@@ -344,7 +339,7 @@ const Payment = () => {
             <p className="text-white/30">Piece ID: <span className="text-white/60 font-mono break-all">{piece.id}</span></p>
           </div>
           <button
-            onClick={goBackToCollection}
+            onClick={goBackToPiece}
             className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer"
           >
             Return to collection
@@ -408,14 +403,6 @@ const Payment = () => {
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
-
-        <button
-          onClick={goBackToCollection}
-          className="flex items-center gap-1.5 text-white/30 text-xs hover:text-white transition-colors bg-transparent border-none cursor-pointer self-start"
-        >
-          <FiArrowLeft size={12} /> {collectionName}
-        </button>
-
         <div className="flex justify-between items-start">
           <div>
             <p className="text-white/30 text-xs uppercase tracking-widest mb-1">{collectionName}</p>
