@@ -296,14 +296,6 @@ const BiddingPage = () => {
 
         {/* RIGHT */}
         <div className="flex flex-col gap-4">
-          {auction.status === "error" && (
-            <div className="border border-red-500/20 bg-red-500/5 rounded-lg px-4 py-3">
-              <p className="text-red-400 text-xs">
-                {auction.errorMsg ?? "Cannot connect to auction server"}
-              </p>
-            </div>
-          )}
-
           {auction.status === "locked" && (
             <div className="border border-yellow-500/20 bg-yellow-500/5 rounded-lg px-4 py-3">
               <p className="text-yellow-400 text-xs animate-pulse">
@@ -432,6 +424,14 @@ const BiddingPage = () => {
               </div>
             )}
           </div>
+
+          {auction.status === "error" && (
+            <div className="border border-red-500/20 bg-red-500/5 rounded-lg px-4 py-3">
+              <p className="text-red-400 text-xs">
+                {auction.errorMsg ?? "Cannot connect to auction server"}
+              </p>
+            </div>
+          )}
 
           <button
             onClick={handleSubmitBid}

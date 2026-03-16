@@ -137,7 +137,7 @@ export function useAuction(pieceId: string) {
     const onClose = () => {
       sockets.delete(pieceId);
       if (!intentionalRef.current) {
-        setState(s => ({ ...s, status: "error", errorMsg: "Disconnected from auction server" }));
+        setState(s => ({ ...s, status: "error", errorMsg: "Disconnected from auction server, please refresh" }));
       }
     };
 
