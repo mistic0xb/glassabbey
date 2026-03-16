@@ -10,7 +10,8 @@ export function getPool(): SimplePool {
 }
 
 export const DEFAULT_RELAYS = [
-    "wss://relay.angor.io/",
-    "wss://relay2.angor.io",
-    "wss://relay.damus.io",
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://nostr.mom",
+  "wss://relay.angor.io/",
 ];
