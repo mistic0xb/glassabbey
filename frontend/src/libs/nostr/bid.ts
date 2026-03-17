@@ -61,7 +61,16 @@ export async function fetchBidsForPiece(pieceId: string): Promise<Bid[]> {
         oneose() {
           clearTimeout(timeout);
           if (sub) sub.close();
-          resolve(sortBids(bids));
+          // Deduplicate — same bidderName+willingAmt = same bid published multiple times
+          const seen = new Map<string, Bid>();
+          for (const bid of bids) {
+            const key = `${bid.bidderName}-${bid.willingAmt}`;
+            const existing = seen.get(key);
+            if (!existing || bid.createdAt > existing.createdAt) {
+              seen.set(key, bid);
+            }
+          }
+          resolve(sortBids(Array.from(seen.values())))
         },
       }
     );

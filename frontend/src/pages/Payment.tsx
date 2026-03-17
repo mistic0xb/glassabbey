@@ -1,16 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { QRCodeSVG } from "qrcode.react";
-import {
-  FiCheck,
-  FiCopy,
-  FiZap,
-  FiArrowLeft,
-  FiAlertTriangle,
-} from "react-icons/fi";
+import { FiCheck, FiCopy, FiZap, FiArrowLeft } from "react-icons/fi";
 import { generatePieceInvoice, monitorZapPayment } from "../libs/nostr/nip57";
-import { createSignedBid, publishSignedBid } from "../libs/nostr/bid";
-import type { Event } from "nostr-tools";
 import { useAuction } from "../libs/useAuction";
 import type { Piece, Collection } from "../types/types";
 
@@ -38,10 +30,8 @@ interface PersistedPaymentState {
   recipientPubkey: string;
   collectionName: string;
   collectionId: string;
-  collectionSlug: string;
-  signedBidEvent: Event;
   confirmed: boolean;
-  lockStartTime: number; // ms timestamp when invoice was generated
+  lockStartTime: number;
 }
 
 const SESSION_KEY = "glassabbey_payment";
@@ -71,30 +61,7 @@ const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
 const TIMER_SECONDS = 60;
-const PUBLISH_MAX_RETRIES = 3;
-const PUBLISH_RETRY_DELAY_MS = 2000;
 
-async function publishBidWithRetry(
-  signedEvent: Event,
-  onAttempt?: (attempt: number) => void,
-): Promise<void> {
-  for (let attempt = 1; attempt <= PUBLISH_MAX_RETRIES; attempt++) {
-    try {
-      onAttempt?.(attempt);
-      await publishSignedBid(signedEvent);
-      return;
-    } catch (err) {
-      console.error(`publishBid attempt ${attempt} failed:`, err);
-      if (attempt < PUBLISH_MAX_RETRIES) {
-        await new Promise((r) => setTimeout(r, PUBLISH_RETRY_DELAY_MS));
-      }
-    }
-  }
-  throw new Error("Failed to publish bid after all retries");
-}
-
-// Calculate how many seconds remain based on when the lock started.
-// Returns 0 if already expired.
 function calcTimeLeft(lockStartTime: number): number {
   const elapsed = Math.floor((Date.now() - lockStartTime) / 1000);
   return Math.max(0, TIMER_SECONDS - elapsed);
@@ -154,21 +121,23 @@ const Payment = () => {
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState<
-    "idle" | "waiting" | "publishing" | "publish_failed" | "confirmed"
-  >("idle");
-  const [publishAttempt, setPublishAttempt] = useState(0);
-
-  // Initialise timer from session if resuming, otherwise default.
-  // Will be set accurately once lockStartTime is known.
+  const [status, setStatus] = useState<"idle" | "waiting" | "confirmed">(
+    "idle",
+  );
   const [timeLeft, setTimeLeft] = useState<number>(() =>
     session?.lockStartTime
       ? calcTimeLeft(session.lockStartTime)
       : TIMER_SECONDS,
   );
 
-  const handledRef = useRef(false);
-  const signedBidRef = useRef<Event | null>(null);
+  // Read confirmed state fresh from sessionStorage — not from stale closure
+  const handledRef = useRef(
+    !!(
+      session?.confirmed &&
+      session.pieceId === piece.id &&
+      session.willingAmt === willingAmt
+    ),
+  );
 
   const {
     cancelBid,
@@ -182,55 +151,33 @@ const Payment = () => {
     navigate(`/piece/${piece.id}`);
   }, [piece.id, navigate]);
 
-  const handlePaymentConfirmed = useCallback(async () => {
+  // Payment confirmed — server already published to Nostr, just navigate away
+  const handlePaymentConfirmed = useCallback(() => {
     if (handledRef.current) return;
     handledRef.current = true;
-    setStatus("publishing");
 
-    if (session) saveSession({ ...session, confirmed: true });
+    // Mark confirmed in session immediately so refresh won't re-run flow
+    const currentSession = loadSession();
+    if (currentSession) saveSession({ ...currentSession, confirmed: true });
 
-    const eventToPublish =
-      signedBidRef.current ?? session?.signedBidEvent ?? null;
-    if (!eventToPublish) {
-      console.error("[Payment] No signed bid event — cannot publish");
-      setStatus("publish_failed");
-      return;
-    }
-
-    try {
-      await publishBidWithRetry(eventToPublish, (attempt) =>
-        setPublishAttempt(attempt),
-      );
-      setStatus("confirmed");
+    setStatus("confirmed");
+    setTimeout(() => {
       clearSession();
-    } catch (err) {
-      console.error("publishBid failed after all retries:", err);
-      setStatus("publish_failed");
-      return;
-    }
+      goBackToPiece();
+    }, 3000);
+  }, [goBackToPiece]);
 
-    setTimeout(() => goBackToPiece(), 3000);
-  }, [piece, willingAmt, submitAmt, bidderName, goBackToPiece, session]);
-
-  // On mount: handle Safari resume
+  // On mount: if already confirmed (Safari resume / refresh), skip straight to confirmed
   useEffect(() => {
-    if (
-      session?.confirmed &&
-      session.pieceId === piece.id &&
-      session.willingAmt === willingAmt
-    ) {
+    if (handledRef.current) {
       console.log(
-        "[Payment] Resuming confirmed payment — skipping to confirmed",
+        "[Payment] Already confirmed on mount — skipping to confirmed screen",
       );
-      handledRef.current = true;
       setStatus("confirmed");
-      clearSession();
-      setTimeout(() => goBackToPiece(), 3000);
-      return;
-    }
-    if (session?.signedBidEvent && session.pieceId === piece.id) {
-      console.log("[Payment] Restoring signed bid event from sessionStorage");
-      signedBidRef.current = session.signedBidEvent;
+      setTimeout(() => {
+        clearSession();
+        goBackToPiece();
+      }, 3000);
     }
   }, []);
 
@@ -277,7 +224,7 @@ const Payment = () => {
     handlePaymentConfirmed,
   ]);
 
-  // Generate invoice on mount
+  // Generate invoice on mount — skipped if already confirmed
   useEffect(() => {
     if (handledRef.current) return;
 
@@ -296,44 +243,22 @@ const Payment = () => {
         setZapRequestId(result.zapRequestId);
         setStatus("waiting");
 
-        if (!signedBidRef.current) {
-          const signed = createSignedBid(
-            piece.id,
-            willingAmt,
-            submitAmt,
-            bidderName,
-          );
-          signedBidRef.current = signed;
-
-          const lockStartTime = Date.now();
-          // Correct the timer to exactly TIMER_SECONDS from now
-          setTimeLeft(TIMER_SECONDS);
-
-          const collectionSlug = collectionName
-            .toLowerCase()
-            .replace(/\s+/g, "-")
-            .replace(/[^a-z0-9-]/g, "");
-          saveSession({
-            pieceId: piece.id,
-            willingAmt,
-            submitAmt,
-            bidderName,
-            lockToken,
-            lightningAddress,
-            recipientPubkey,
-            collectionName,
-            collectionId: collection.id,
-            collectionSlug,
-            signedBidEvent: signed,
-            confirmed: false,
-            lockStartTime,
-          });
-        } else {
-          // Resuming from session — recalculate time left accurately
-          if (session?.lockStartTime) {
-            setTimeLeft(calcTimeLeft(session.lockStartTime));
-          }
-        }
+        // Save session for Safari resume — no signed event needed anymore
+        const lockStartTime = Date.now();
+        setTimeLeft(TIMER_SECONDS);
+        saveSession({
+          pieceId: piece.id,
+          willingAmt,
+          submitAmt,
+          bidderName,
+          lockToken,
+          lightningAddress,
+          recipientPubkey,
+          collectionName,
+          collectionId: collection.id,
+          confirmed: false,
+          lockStartTime,
+        });
 
         if (result.paymentHash) {
           const ws = new WebSocket(`${WS_URL}?pieceId=${piece.id}`);
@@ -375,7 +300,7 @@ const Payment = () => {
     return () => unsubscribe();
   }, [invoice, zapRequestId, status, handlePaymentConfirmed, confirmZap]);
 
-  // Focus/visibility recheck
+  // Focus/visibility recheck — mobile user returned from wallet
   useEffect(() => {
     if (status !== "waiting") return;
 
@@ -385,10 +310,8 @@ const Payment = () => {
         "[Payment] Browser returned to foreground — checking payment status",
       );
 
-      // Recalculate time left accurately on return
-      if (session?.lockStartTime) {
-        setTimeLeft(calcTimeLeft(session.lockStartTime));
-      }
+      const s = loadSession();
+      if (s?.lockStartTime) setTimeLeft(calcTimeLeft(s.lockStartTime));
 
       setTimeout(() => {
         if (handledRef.current) return;
@@ -430,10 +353,9 @@ const Payment = () => {
     handlePaymentConfirmed,
     confirmZap,
     checkPayment,
-    session,
   ]);
 
-  // Countdown — ticks from whatever timeLeft currently is
+  // Countdown
   useEffect(() => {
     if (status !== "waiting") return;
     const interval = setInterval(() => {
@@ -508,68 +430,7 @@ const Payment = () => {
   const timerSeconds = timeLeft % 60;
   const timerLabel = `${timerMinutes}:${String(timerSeconds).padStart(2, "0")}`;
 
-  if (status === "publish_failed") {
-    return (
-      <div className="min-h-screen flex items-center justify-center p-4">
-        <div className="border border-yellow-500/30 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-yellow-500/5">
-          <div className="w-16 h-16 rounded-full bg-yellow-500/10 border border-yellow-500/30 flex items-center justify-center">
-            <FiAlertTriangle className="text-yellow-400 text-3xl" />
-          </div>
-          <div>
-            <h2 className="text-white font-bold text-xl mb-2">
-              Payment received, bid not recorded
-            </h2>
-            <p className="text-white/50 text-sm leading-relaxed">
-              Your payment of{" "}
-              <span className="text-white/80">
-                {formatSats(submitAmt)} sats
-              </span>{" "}
-              went through, but we couldn't write your bid to the relay. Please
-              contact support with the details below.
-            </p>
-          </div>
-          <div className="border border-white/10 rounded-lg px-4 py-3 text-xs text-left w-full flex flex-col gap-1">
-            <p className="text-white/30">
-              Piece: <span className="text-white/60">{piece.artifactName}</span>
-            </p>
-            <p className="text-white/30">
-              Bidder: <span className="text-white/60">{bidderName}</span>
-            </p>
-            <p className="text-white/30">
-              Willing amt:{" "}
-              <span className="text-white/60">
-                {willingAmt.toLocaleString()} sats
-              </span>
-            </p>
-            <p className="text-white/30">
-              Deposit:{" "}
-              <span className="text-white/60">
-                {submitAmt.toLocaleString()} sats
-              </span>
-            </p>
-            <p className="text-white/30">
-              Piece ID:{" "}
-              <span className="text-white/60 font-mono break-all">
-                {piece.id}
-              </span>
-            </p>
-          </div>
-          <button
-            onClick={goBackToPiece}
-            className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer"
-          >
-            Return to piece
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (status === "confirmed" || status === "publishing") {
-    const publishingLabel =
-      publishAttempt > 1
-        ? `Publishing bid (attempt ${publishAttempt}/${PUBLISH_MAX_RETRIES})…`
-        : "Publishing your bid…";
+  if (status === "confirmed") {
     return (
       <div className="min-h-screen flex items-center justify-center p-4">
         <div className="border border-white/10 rounded-lg p-8 max-w-sm w-full text-center flex flex-col items-center gap-5 bg-white/2">
@@ -581,9 +442,7 @@ const Payment = () => {
               Payment Confirmed
             </h2>
             <p className="text-white/40 text-sm">
-              {status === "publishing"
-                ? publishingLabel
-                : "Bid recorded. Returning to piece…"}
+              Bid recorded. Returning to piece…
             </p>
           </div>
           <div className="border border-white/10 rounded px-4 py-2 text-sm">

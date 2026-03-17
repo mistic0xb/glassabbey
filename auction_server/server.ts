@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
 import { SimplePool } from "nostr-tools/pool";
-import { finalizeEvent, getPublicKey } from "nostr-tools";
+import { generateSecretKey, getPublicKey, finalizeEvent } from "nostr-tools";
 import * as nip44 from "nostr-tools/nip44";
 import * as nip04 from "nostr-tools/nip04";
 import { hexToBytes } from "@noble/hashes/utils.js";
@@ -89,6 +89,158 @@ function getNWC(lightningAddress: string): string | null {
     return store[lightningAddress.toLowerCase().trim()] ?? null;
 }
 
+// ─── Nostr bid publish queue ──────────────────────────────────────────────────
+// When a bid is confirmed, we enqueue it for Nostr publishing.
+// If publishing fails, we retry with exponential backoff up to MAX_ATTEMPTS.
+// bids.json is always written first — Nostr is secondary/display only.
+// The signed event is created once per queue entry and reused on every retry
+// so the relay deduplicates correctly (same pubkey + same d-tag).
+
+const PUBLISH_MAX_ATTEMPTS = 10;
+const PUBLISH_BASE_DELAY_MS = 5_000;   // 5s first retry
+const PUBLISH_MAX_DELAY_MS = 300_000;  // cap at 5 minutes
+
+interface PublishQueueEntry {
+    id: string;           // internal dedup key
+    pieceId: string;
+    willingAmt: number;
+    submitAmt: number;
+    bidderName: string;
+    signedEvent: ReturnType<typeof finalizeEvent>;
+    attempts: number;
+    nextRetryAt: number;  // ms timestamp
+}
+
+// In-memory queue — survives relay blips, lost on server restart
+// (acceptable: bids.json has the canonical record)
+const publishQueue = new Map<string, PublishQueueEntry>();
+let publishLoopRunning = false;
+
+const pieceBidTag = (pieceId: string) => `glassabbey-bid:${pieceId}`;
+
+function createBidEvent(
+    pieceId: string,
+    willingAmt: number,
+    submitAmt: number,
+    bidderName: string,
+): ReturnType<typeof finalizeEvent> {
+    const sk = generateSecretKey();
+    const pk = getPublicKey(sk);
+    return finalizeEvent({
+        kind: 30078,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [
+            // Stable d-tag — relay deduplicates on (pubkey, kind, d-tag)
+            // pubkey is unique per bid (fresh keypair) but d-tag is stable
+            // so retries with the same signed event won't duplicate
+            ["d", `bid-${pieceId}-${willingAmt}`],
+            ["t", "glassabbey-bid"],
+            ["t", pieceBidTag(pieceId)],
+        ],
+        content: JSON.stringify({ willingAmt, submitAmt, bidderName }),
+    }, sk);
+}
+
+async function attemptPublish(entry: PublishQueueEntry): Promise<void> {
+    const pool = new SimplePool();
+    try {
+        const pubs = pool.publish(RELAYS, entry.signedEvent);
+        await Promise.race([
+            Promise.any(pubs),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("publish timeout")), 8000)
+            ),
+        ]);
+        console.log(`[${entry.pieceId}] Nostr bid published — willingAmt=${entry.willingAmt} (attempt ${entry.attempts})`);
+    } finally {
+        pool.close(RELAYS);
+    }
+}
+
+function enqueueBidPublish(
+    pieceId: string,
+    willingAmt: number,
+    submitAmt: number,
+    bidderName: string,
+): void {
+    const id = `${pieceId}-${willingAmt}`;
+
+    // Dedup — don't re-enqueue if already queued (e.g. double ZAP_CONFIRMED)
+    if (publishQueue.has(id)) {
+        console.log(`[${pieceId}] Publish already queued for willingAmt=${willingAmt} — skipping`);
+        return;
+    }
+
+    // Create and sign the event once — same event reused on every retry
+    const signedEvent = createBidEvent(pieceId, willingAmt, submitAmt, bidderName);
+
+    publishQueue.set(id, {
+        id,
+        pieceId,
+        willingAmt,
+        submitAmt,
+        bidderName,
+        signedEvent,
+        attempts: 0,
+        nextRetryAt: Date.now(), // attempt immediately
+    });
+
+    console.log(`[${pieceId}] Enqueued Nostr publish for willingAmt=${willingAmt}`);
+    ensurePublishLoopRunning();
+}
+
+function ensurePublishLoopRunning(): void {
+    if (publishLoopRunning) return;
+    publishLoopRunning = true;
+    runPublishLoop();
+}
+
+async function runPublishLoop(): Promise<void> {
+    while (publishQueue.size > 0) {
+        const now = Date.now();
+
+        for (const [id, entry] of publishQueue) {
+            if (entry.nextRetryAt > now) continue; // not ready yet
+
+            entry.attempts++;
+            console.log(`[${entry.pieceId}] Attempting Nostr publish — willingAmt=${entry.willingAmt}, attempt=${entry.attempts}/${PUBLISH_MAX_ATTEMPTS}`);
+
+            try {
+                await attemptPublish(entry);
+                // Success — remove from queue
+                publishQueue.delete(id);
+                console.log(`[${entry.pieceId}] Nostr publish succeeded — removed from queue`);
+            } catch (e) {
+                console.warn(`[${entry.pieceId}] Nostr publish attempt ${entry.attempts} failed:`, e);
+
+                if (entry.attempts >= PUBLISH_MAX_ATTEMPTS) {
+                    // Give up — log prominently, bids.json still has the record
+                    publishQueue.delete(id);
+                    console.error(
+                        `[${entry.pieceId}] NOSTR PUBLISH FAILED after ${PUBLISH_MAX_ATTEMPTS} attempts — ` +
+                        `willingAmt=${entry.willingAmt}, bidderName=${entry.bidderName}. ` +
+                        `Bid is confirmed in bids.json but NOT on Nostr relays.`
+                    );
+                } else {
+                    // Exponential backoff: 5s, 10s, 20s, 40s... capped at 5min
+                    const delay = Math.min(
+                        PUBLISH_BASE_DELAY_MS * Math.pow(2, entry.attempts - 1),
+                        PUBLISH_MAX_DELAY_MS,
+                    );
+                    entry.nextRetryAt = Date.now() + delay;
+                    console.log(`[${entry.pieceId}] Scheduling retry in ${Math.round(delay / 1000)}s`);
+                }
+            }
+        }
+
+        // Sleep 1s between loop ticks to avoid busy-waiting
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    publishLoopRunning = false;
+    console.log("[publish-queue] Queue empty — loop stopped");
+}
+
 // ─── NWC client ───────────────────────────────────────────────────────────────
 
 interface NWCConfig {
@@ -123,8 +275,6 @@ async function nwcDecrypt(config: NWCConfig, ciphertext: string): Promise<string
 }
 
 // ─── Nostr rehydration ────────────────────────────────────────────────────────
-
-const pieceBidTag = (pieceId: string) => `glassabbey-bid:${pieceId}`;
 
 async function fetchPriceFromNostr(pieceId: string): Promise<number> {
     const pool = new SimplePool();
@@ -172,7 +322,7 @@ async function fetchPriceFromNostr(pieceId: string): Promise<number> {
 
 interface Lock {
     ws: WebSocket;
-    lockToken: string;   // UUID sent to winning bidder — used for cancel identity
+    lockToken: string;
     bidderName: string;
     bidAmt: number;
     submitAmt: number;
@@ -258,8 +408,6 @@ function sendState(ws: WebSocket, piece: PieceState): void {
         type: "STATE",
         currentPrice: piece.currentPrice,
         locked: !!piece.lock,
-        // Expose the current lock's willingAmt publicly so reconnecting
-        // Payment.tsx can identify if its bid is still the active lock
         lockWillingAmt: piece.lock?.willingAmt ?? null,
     });
 }
@@ -288,7 +436,6 @@ function tryAcquireLock(
     piece.lock = { ws, lockToken, bidderName, bidAmt, submitAmt, willingAmt, timer };
     console.log(`[${pieceId}] Lock acquired by ${bidderName}: bidAmt=${bidAmt}, submitAmt=${submitAmt}, willingAmt=${willingAmt}, lockToken=${lockToken}`);
 
-    // Send lockToken only to the winning bidder — no one else ever sees it
     send(ws, { type: "BID_WON", willingAmt, submitAmt, bidderName, lockToken });
     broadcast(piece, { type: "BID_LOCKED", reason: "A bidder is completing payment, please wait" }, ws);
 }
@@ -316,6 +463,7 @@ function confirmPayment(piece: PieceState, pieceId: string, source: "nwc" | "zap
     piece.lastConfirmedWillingAmt = willingAmt;
     piece.currentPrice = newPrice;
 
+    // Write to bids.json — ground truth, always written before Nostr publish
     writeBid(pieceId, {
         currentPrice: newPrice,
         bidderName,
@@ -323,6 +471,10 @@ function confirmPayment(piece: PieceState, pieceId: string, source: "nwc" | "zap
         submitAmt,
         confirmedAt: Date.now(),
     });
+
+    // Enqueue Nostr publish — retried with backoff if relays are unavailable
+    // Client no longer publishes bids — this is the single publish point
+    enqueueBidPublish(pieceId, willingAmt, submitAmt, bidderName);
 
     clearTimeout(piece.lock.timer);
     piece.lock = null;
@@ -477,7 +629,6 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const pieceId = url.searchParams.get("pieceId");
     const action = url.searchParams.get("action");
 
-    // ── NWC registration: ?action=register ──
     if (action === "register") {
         ws.on("message", (raw: Buffer) => {
             try {
@@ -549,8 +700,6 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                 break;
             }
             case "CANCEL_BID": {
-                // Match by lockToken — unguessable UUID known only to the winning bidder.
-                // Safe across reconnects: even a new socket can cancel if it has the token.
                 const { lockToken } = msg;
                 if (!lockToken) {
                     send(ws, { type: "ERROR", reason: "Missing lockToken" });
@@ -585,8 +734,6 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
                 break;
             }
             case "CHECK_PAYMENT": {
-                // Client reconnected after going to wallet app — check if their payment
-                // was already confirmed while they were backgrounded.
                 const { lockToken, willingAmt } = msg;
                 if (!lockToken || !willingAmt) {
                     send(ws, { type: "ERROR", reason: "Missing lockToken or willingAmt" });
@@ -595,21 +742,18 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
 
                 console.log(`[${pieceId}] CHECK_PAYMENT — lockToken=${lockToken}, willingAmt=${willingAmt}`);
 
-                // Case 1: payment was already confirmed — lastConfirmedWillingAmt matches
                 if (piece.lastConfirmedWillingAmt === willingAmt) {
                     console.log(`[${pieceId}] CHECK_PAYMENT — already confirmed, notifying client`);
                     send(ws, { type: "PAYMENT_ALREADY_CONFIRMED", willingAmt });
                     return;
                 }
 
-                // Case 2: lock is still active and this client is the lock holder
                 if (piece.lock?.lockToken === lockToken) {
                     console.log(`[${pieceId}] CHECK_PAYMENT — lock still active, client is lock holder`);
                     send(ws, { type: "LOCK_STILL_ACTIVE", willingAmt, submitAmt: piece.lock.submitAmt });
                     return;
                 }
 
-                // Case 3: lock expired without confirmation (payment failed or timed out)
                 console.log(`[${pieceId}] CHECK_PAYMENT — lock expired, no confirmation found`);
                 send(ws, { type: "PAYMENT_NOT_FOUND" });
                 break;
@@ -623,8 +767,6 @@ wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
         piece.clients.delete(ws);
         console.log(`[${pieceId}] Client disconnected (${piece.clients.size} remaining)`);
 
-        // Do NOT release lock on disconnect — mobile users leave browser to open
-        // wallet app. Lock survives; 2-minute timer is the only expiry.
         if (piece.lock?.ws === ws) {
             console.log(`[${pieceId}] Lock holder disconnected — lock kept alive (mobile payment in progress)`);
         }
