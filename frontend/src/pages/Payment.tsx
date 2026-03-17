@@ -28,6 +28,45 @@ interface PaymentState {
   lockToken: string;
 }
 
+interface PersistedPaymentState {
+  pieceId: string;
+  willingAmt: number;
+  submitAmt: number;
+  bidderName: string;
+  lockToken: string;
+  lightningAddress: string;
+  recipientPubkey: string;
+  collectionName: string;
+  collectionId: string;
+  collectionSlug: string;
+  signedBidEvent: Event;
+  confirmed: boolean;
+  lockStartTime: number; // ms timestamp when invoice was generated
+}
+
+const SESSION_KEY = "glassabbey_payment";
+
+function saveSession(data: PersistedPaymentState): void {
+  try {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  } catch {}
+}
+
+function loadSession(): PersistedPaymentState | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearSession(): void {
+  try {
+    sessionStorage.removeItem(SESSION_KEY);
+  } catch {}
+}
+
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
@@ -35,21 +74,14 @@ const TIMER_SECONDS = 60;
 const PUBLISH_MAX_RETRIES = 3;
 const PUBLISH_RETRY_DELAY_MS = 2000;
 
-// Sign once, retry publishing the same event — prevents duplicate relay entries
 async function publishBidWithRetry(
-  pieceId: string,
-  willingAmt: number,
-  submitAmt: number,
-  bidderName: string,
+  signedEvent: Event,
   onAttempt?: (attempt: number) => void,
 ): Promise<void> {
-  // Create and sign the event exactly once
-  const signedEvent: Event = createSignedBid(pieceId, willingAmt, submitAmt, bidderName);
-
   for (let attempt = 1; attempt <= PUBLISH_MAX_RETRIES; attempt++) {
     try {
       onAttempt?.(attempt);
-      await publishSignedBid(signedEvent); // same event every retry
+      await publishSignedBid(signedEvent);
       return;
     } catch (err) {
       console.error(`publishBid attempt ${attempt} failed:`, err);
@@ -61,9 +93,61 @@ async function publishBidWithRetry(
   throw new Error("Failed to publish bid after all retries");
 }
 
+// Calculate how many seconds remain based on when the lock started.
+// Returns 0 if already expired.
+function calcTimeLeft(lockStartTime: number): number {
+  const elapsed = Math.floor((Date.now() - lockStartTime) / 1000);
+  return Math.max(0, TIMER_SECONDS - elapsed);
+}
+
 const Payment = () => {
   const navigate = useNavigate();
   const { state } = useLocation() as { state: PaymentState | null };
+
+  const session = loadSession();
+
+  const paymentContext =
+    state ??
+    (session
+      ? ({
+          piece: {
+            id: session.pieceId,
+            artifactName: "",
+            makerName: "",
+            collectionId: "",
+            creatorPubkey: "",
+          } as Piece,
+          collection: {
+            id: session.collectionId,
+            name: session.collectionName,
+            lightningAddress: session.lightningAddress,
+          } as Collection,
+          collectionName: session.collectionName,
+          lightningAddress: session.lightningAddress,
+          recipientPubkey: session.recipientPubkey,
+          willingAmt: session.willingAmt,
+          submitAmt: session.submitAmt,
+          bidderName: session.bidderName,
+          lockToken: session.lockToken,
+        } as PaymentState)
+      : null);
+
+  if (!paymentContext) {
+    navigate(-1);
+    return null;
+  }
+
+  const {
+    piece,
+    collection,
+    collectionName,
+    lightningAddress,
+    recipientPubkey,
+    willingAmt,
+    submitAmt,
+    bidderName,
+    lockToken,
+  } = paymentContext;
 
   const [invoice, setInvoice] = useState<string | null>(null);
   const [zapRequestId, setZapRequestId] = useState<string | null>(null);
@@ -74,47 +158,51 @@ const Payment = () => {
     "idle" | "waiting" | "publishing" | "publish_failed" | "confirmed"
   >("idle");
   const [publishAttempt, setPublishAttempt] = useState(0);
-  const [timeLeft, setTimeLeft] = useState(TIMER_SECONDS);
+
+  // Initialise timer from session if resuming, otherwise default.
+  // Will be set accurately once lockStartTime is known.
+  const [timeLeft, setTimeLeft] = useState<number>(() =>
+    session?.lockStartTime
+      ? calcTimeLeft(session.lockStartTime)
+      : TIMER_SECONDS,
+  );
 
   const handledRef = useRef(false);
-
-  if (!state) {
-    navigate(-1);
-    return null;
-  }
+  const signedBidRef = useRef<Event | null>(null);
 
   const {
-    piece,
-    collectionName,
-    lightningAddress,
-    recipientPubkey,
-    willingAmt,
-    submitAmt,
-    bidderName,
-    lockToken,
-  } = state;
+    cancelBid,
+    confirmZap,
+    checkPayment,
+    setPaymentCallbacks,
+    state: auctionState,
+  } = useAuction(piece.id);
 
-  const { cancelBid, confirmZap, checkPayment, setPaymentCallbacks, state: auctionState } =
-    useAuction(piece.id);
-
-  const goBackToPiece= useCallback(() => {
-  navigate(`/piece/${piece.id}`);
-}, [piece.id, navigate]);
+  const goBackToPiece = useCallback(() => {
+    navigate(`/piece/${piece.id}`);
+  }, [piece.id, navigate]);
 
   const handlePaymentConfirmed = useCallback(async () => {
     if (handledRef.current) return;
     handledRef.current = true;
     setStatus("publishing");
 
+    if (session) saveSession({ ...session, confirmed: true });
+
+    const eventToPublish =
+      signedBidRef.current ?? session?.signedBidEvent ?? null;
+    if (!eventToPublish) {
+      console.error("[Payment] No signed bid event — cannot publish");
+      setStatus("publish_failed");
+      return;
+    }
+
     try {
-      await publishBidWithRetry(
-        piece.id,
-        willingAmt,
-        submitAmt,
-        bidderName,
-        (attempt) => setPublishAttempt(attempt),
+      await publishBidWithRetry(eventToPublish, (attempt) =>
+        setPublishAttempt(attempt),
       );
       setStatus("confirmed");
+      clearSession();
     } catch (err) {
       console.error("publishBid failed after all retries:", err);
       setStatus("publish_failed");
@@ -122,26 +210,52 @@ const Payment = () => {
     }
 
     setTimeout(() => goBackToPiece(), 3000);
-  }, [piece, willingAmt, submitAmt, bidderName, goBackToPiece]);
+  }, [piece, willingAmt, submitAmt, bidderName, goBackToPiece, session]);
 
-  // Register callbacks for CHECK_PAYMENT server responses
+  // On mount: handle Safari resume
+  useEffect(() => {
+    if (
+      session?.confirmed &&
+      session.pieceId === piece.id &&
+      session.willingAmt === willingAmt
+    ) {
+      console.log(
+        "[Payment] Resuming confirmed payment — skipping to confirmed",
+      );
+      handledRef.current = true;
+      setStatus("confirmed");
+      clearSession();
+      setTimeout(() => goBackToPiece(), 3000);
+      return;
+    }
+    if (session?.signedBidEvent && session.pieceId === piece.id) {
+      console.log("[Payment] Restoring signed bid event from sessionStorage");
+      signedBidRef.current = session.signedBidEvent;
+    }
+  }, []);
+
+  // Register CHECK_PAYMENT callbacks
   useEffect(() => {
     setPaymentCallbacks(
       (confirmedWillingAmt) => {
         if (confirmedWillingAmt === willingAmt) {
-          console.log("[Payment] Server: payment already confirmed while backgrounded");
+          console.log(
+            "[Payment] Server: payment already confirmed while backgrounded",
+          );
           handlePaymentConfirmed();
         }
       },
       (activeWillingAmt) => {
         if (activeWillingAmt === willingAmt) {
-          console.log("[Payment] Server: lock still active, continuing to wait");
+          console.log(
+            "[Payment] Server: lock still active, continuing to wait",
+          );
         }
       },
     );
   }, [willingAmt, handlePaymentConfirmed, setPaymentCallbacks]);
 
-  // Watch for NEW_BID matching our willingAmt — server signals payment confirmed
+  // Watch for NEW_BID matching our willingAmt
   useEffect(() => {
     if (status !== "waiting") return;
     if (
@@ -149,16 +263,24 @@ const Payment = () => {
       auctionState.currentHighestBid > 0 &&
       auctionState.wonDetails === null
     ) {
-      const expectedNewPrice = willingAmt - submitAmt;
-      if (auctionState.currentHighestBid === expectedNewPrice) {
+      if (auctionState.currentHighestBid === willingAmt - submitAmt) {
         console.log("[Payment] NEW_BID matches — payment confirmed by server");
         handlePaymentConfirmed();
       }
     }
-  }, [auctionState.status, auctionState.currentHighestBid, status, willingAmt, submitAmt, handlePaymentConfirmed]);
+  }, [
+    auctionState.status,
+    auctionState.currentHighestBid,
+    status,
+    willingAmt,
+    submitAmt,
+    handlePaymentConfirmed,
+  ]);
 
-  // Generate invoice on mount, send START_PAYMENT to server
+  // Generate invoice on mount
   useEffect(() => {
+    if (handledRef.current) return;
+
     const generate = async () => {
       setGenerating(true);
       setError(null);
@@ -174,22 +296,67 @@ const Payment = () => {
         setZapRequestId(result.zapRequestId);
         setStatus("waiting");
 
+        if (!signedBidRef.current) {
+          const signed = createSignedBid(
+            piece.id,
+            willingAmt,
+            submitAmt,
+            bidderName,
+          );
+          signedBidRef.current = signed;
+
+          const lockStartTime = Date.now();
+          // Correct the timer to exactly TIMER_SECONDS from now
+          setTimeLeft(TIMER_SECONDS);
+
+          const collectionSlug = collectionName
+            .toLowerCase()
+            .replace(/\s+/g, "-")
+            .replace(/[^a-z0-9-]/g, "");
+          saveSession({
+            pieceId: piece.id,
+            willingAmt,
+            submitAmt,
+            bidderName,
+            lockToken,
+            lightningAddress,
+            recipientPubkey,
+            collectionName,
+            collectionId: collection.id,
+            collectionSlug,
+            signedBidEvent: signed,
+            confirmed: false,
+            lockStartTime,
+          });
+        } else {
+          // Resuming from session — recalculate time left accurately
+          if (session?.lockStartTime) {
+            setTimeLeft(calcTimeLeft(session.lockStartTime));
+          }
+        }
+
         if (result.paymentHash) {
           const ws = new WebSocket(`${WS_URL}?pieceId=${piece.id}`);
           ws.onopen = () => {
-            ws.send(JSON.stringify({
-              type: "START_PAYMENT",
-              paymentHash: result.paymentHash,
-              lightningAddress,
-            }));
+            ws.send(
+              JSON.stringify({
+                type: "START_PAYMENT",
+                paymentHash: result.paymentHash,
+                lightningAddress,
+              }),
+            );
             setTimeout(() => ws.close(), 1000);
           };
           ws.onerror = () => ws.close();
         } else {
-          console.warn("[Payment] No paymentHash — NWC unavailable, zap fallback only");
+          console.warn(
+            "[Payment] No paymentHash — NWC unavailable, zap fallback only",
+          );
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to generate invoice");
+        setError(
+          err instanceof Error ? err.message : "Failed to generate invoice",
+        );
       } finally {
         setGenerating(false);
       }
@@ -197,34 +364,37 @@ const Payment = () => {
     generate();
   }, []);
 
-  // Zap receipt monitor — client-side fallback
+  // Zap receipt monitor
   useEffect(() => {
     if (!invoice || !zapRequestId || status !== "waiting") return;
-    const unsubscribe = monitorZapPayment(
-      recipientPubkey,
-      zapRequestId,
-      () => {
-        console.log("[Payment] Zap receipt detected — sending ZAP_CONFIRMED");
-        confirmZap();
-        handlePaymentConfirmed();
-      },
-    );
+    const unsubscribe = monitorZapPayment(recipientPubkey, zapRequestId, () => {
+      console.log("[Payment] Zap receipt detected — sending ZAP_CONFIRMED");
+      confirmZap();
+      handlePaymentConfirmed();
+    });
     return () => unsubscribe();
   }, [invoice, zapRequestId, status, handlePaymentConfirmed, confirmZap]);
 
-  // On focus/visibility — mobile user returned from wallet app
+  // Focus/visibility recheck
   useEffect(() => {
     if (status !== "waiting") return;
 
     const onReturn = () => {
       if (handledRef.current) return;
+      console.log(
+        "[Payment] Browser returned to foreground — checking payment status",
+      );
 
-      console.log("[Payment] Browser returned to foreground — checking payment status");
+      // Recalculate time left accurately on return
+      if (session?.lockStartTime) {
+        setTimeLeft(calcTimeLeft(session.lockStartTime));
+      }
 
-      // Ask server if payment was confirmed while backgrounded
-      checkPayment(lockToken, willingAmt);
+      setTimeout(() => {
+        if (handledRef.current) return;
+        checkPayment(lockToken, willingAmt);
+      }, 500);
 
-      // Also recheck zap receipts as fallback
       if (!zapRequestId) return;
       const since = Math.floor(Date.now() / 1000) - 10 * 60;
       const unsub = monitorZapPayment(
@@ -251,17 +421,27 @@ const Payment = () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("focus", onReturn);
     };
-  }, [status, zapRequestId, recipientPubkey, lockToken, willingAmt, handlePaymentConfirmed, confirmZap, checkPayment]);
+  }, [
+    status,
+    zapRequestId,
+    recipientPubkey,
+    lockToken,
+    willingAmt,
+    handlePaymentConfirmed,
+    confirmZap,
+    checkPayment,
+    session,
+  ]);
 
-  // 1-minute countdown
+  // Countdown — ticks from whatever timeLeft currently is
   useEffect(() => {
     if (status !== "waiting") return;
-    setTimeLeft(TIMER_SECONDS);
     const interval = setInterval(() => {
       setTimeLeft((t) => {
         if (t <= 1) {
           clearInterval(interval);
           if (!handledRef.current) {
+            clearSession();
             cancelBid(lockToken);
             goBackToPiece();
           }
@@ -275,24 +455,32 @@ const Payment = () => {
 
   const handleCopy = () => {
     if (!invoice) return;
-    const done = () => { setCopied(true); setTimeout(() => setCopied(false), 2000); };
+    const done = () => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    };
     try {
-      navigator.clipboard.writeText(invoice).then(done).catch(() => {
-        const el = document.createElement("textarea");
-        el.value = invoice;
-        el.style.cssText = "position:fixed;opacity:0";
-        document.body.appendChild(el);
-        el.focus(); el.select();
-        document.execCommand("copy");
-        document.body.removeChild(el);
-        done();
-      });
+      navigator.clipboard
+        .writeText(invoice)
+        .then(done)
+        .catch(() => {
+          const el = document.createElement("textarea");
+          el.value = invoice;
+          el.style.cssText = "position:fixed;opacity:0";
+          document.body.appendChild(el);
+          el.focus();
+          el.select();
+          document.execCommand("copy");
+          document.body.removeChild(el);
+          done();
+        });
     } catch {
       const el = document.createElement("textarea");
       el.value = invoice;
       el.style.cssText = "position:fixed;opacity:0";
       document.body.appendChild(el);
-      el.focus(); el.select();
+      el.focus();
+      el.select();
       document.execCommand("copy");
       document.body.removeChild(el);
       done();
@@ -305,12 +493,17 @@ const Payment = () => {
   };
 
   const handleCancel = () => {
+    clearSession();
     cancelBid(lockToken);
     goBackToPiece();
   };
 
   const timerColor =
-    timeLeft <= 30 ? "text-red-400" : timeLeft <= 60 ? "text-yellow-400" : "text-white/40";
+    timeLeft <= 15
+      ? "text-red-400"
+      : timeLeft <= 30
+        ? "text-yellow-400"
+        : "text-white/40";
   const timerMinutes = Math.floor(timeLeft / 60);
   const timerSeconds = timeLeft % 60;
   const timerLabel = `${timerMinutes}:${String(timerSeconds).padStart(2, "0")}`;
@@ -323,26 +516,49 @@ const Payment = () => {
             <FiAlertTriangle className="text-yellow-400 text-3xl" />
           </div>
           <div>
-            <h2 className="text-white font-bold text-xl mb-2">Payment received, bid not recorded</h2>
+            <h2 className="text-white font-bold text-xl mb-2">
+              Payment received, bid not recorded
+            </h2>
             <p className="text-white/50 text-sm leading-relaxed">
               Your payment of{" "}
-              <span className="text-white/80">{formatSats(submitAmt)} sats</span>{" "}
-              went through, but we couldn't write your bid to the relay.
-              Please contact support with the details below.
+              <span className="text-white/80">
+                {formatSats(submitAmt)} sats
+              </span>{" "}
+              went through, but we couldn't write your bid to the relay. Please
+              contact support with the details below.
             </p>
           </div>
           <div className="border border-white/10 rounded-lg px-4 py-3 text-xs text-left w-full flex flex-col gap-1">
-            <p className="text-white/30">Piece: <span className="text-white/60">{piece.artifactName}</span></p>
-            <p className="text-white/30">Bidder: <span className="text-white/60">{bidderName}</span></p>
-            <p className="text-white/30">Willing amt: <span className="text-white/60">{willingAmt.toLocaleString()} sats</span></p>
-            <p className="text-white/30">Deposit: <span className="text-white/60">{submitAmt.toLocaleString()} sats</span></p>
-            <p className="text-white/30">Piece ID: <span className="text-white/60 font-mono break-all">{piece.id}</span></p>
+            <p className="text-white/30">
+              Piece: <span className="text-white/60">{piece.artifactName}</span>
+            </p>
+            <p className="text-white/30">
+              Bidder: <span className="text-white/60">{bidderName}</span>
+            </p>
+            <p className="text-white/30">
+              Willing amt:{" "}
+              <span className="text-white/60">
+                {willingAmt.toLocaleString()} sats
+              </span>
+            </p>
+            <p className="text-white/30">
+              Deposit:{" "}
+              <span className="text-white/60">
+                {submitAmt.toLocaleString()} sats
+              </span>
+            </p>
+            <p className="text-white/30">
+              Piece ID:{" "}
+              <span className="text-white/60 font-mono break-all">
+                {piece.id}
+              </span>
+            </p>
           </div>
           <button
             onClick={goBackToPiece}
             className="w-full py-2.5 border border-white/10 hover:border-white/25 text-white/40 hover:text-white text-sm rounded transition-colors bg-transparent cursor-pointer"
           >
-            Return to collection
+            Return to piece
           </button>
         </div>
       </div>
@@ -361,15 +577,21 @@ const Payment = () => {
             <FiCheck className="text-green-400 text-3xl" />
           </div>
           <div>
-            <h2 className="text-white font-bold text-xl mb-1">Payment Confirmed</h2>
+            <h2 className="text-white font-bold text-xl mb-1">
+              Payment Confirmed
+            </h2>
             <p className="text-white/40 text-sm">
-              {status === "publishing" ? publishingLabel : "Bid recorded. Returning to collection…"}
+              {status === "publishing"
+                ? publishingLabel
+                : "Bid recorded. Returning to piece…"}
             </p>
           </div>
           <div className="border border-white/10 rounded px-4 py-2 text-sm">
             <span className="text-white/60">{bidderName}</span>
             <span className="text-white/20 mx-2">·</span>
-            <span className="text-green-400 font-semibold">{formatSats(submitAmt)} sats</span>
+            <span className="text-green-400 font-semibold">
+              {formatSats(submitAmt)} sats
+            </span>
           </div>
         </div>
       </div>
@@ -405,15 +627,21 @@ const Payment = () => {
       <div className="border border-white/10 rounded-lg p-6 max-w-sm w-full flex flex-col gap-6 bg-white/2">
         <div className="flex justify-between items-start">
           <div>
-            <p className="text-white/30 text-xs uppercase tracking-widest mb-1">{collectionName}</p>
-            <h1 className="text-white font-semibold text-lg">{piece.artifactName}</h1>
+            <p className="text-white/30 text-xs uppercase tracking-widest mb-1">
+              {collectionName}
+            </p>
+            <h1 className="text-white font-semibold text-lg">
+              {piece.artifactName}
+            </h1>
             <p className="text-white/40 text-sm mt-1">
               Bidding as <span className="text-white/70">{bidderName}</span>
             </p>
           </div>
           <div className="flex flex-col items-end">
             <p className="text-white/20 text-xs mb-0.5">Time left</p>
-            <p className={`font-mono font-bold text-lg tabular-nums ${timerColor}`}>
+            <p
+              className={`font-mono font-bold text-lg tabular-nums ${timerColor}`}
+            >
               {timerLabel}
             </p>
           </div>
@@ -421,7 +649,9 @@ const Payment = () => {
 
         <div className="flex justify-between items-center bg-white/5 border border-white/10 rounded-lg px-4 py-3">
           <span className="text-white/40 text-sm">Deposit amount</span>
-          <span className="text-green-400 font-bold text-xl">{formatSats(submitAmt)} sats</span>
+          <span className="text-green-400 font-bold text-xl">
+            {formatSats(submitAmt)} sats
+          </span>
         </div>
 
         {invoice && (
@@ -434,15 +664,24 @@ const Payment = () => {
               className="flex items-center gap-2 text-white/40 hover:text-white text-sm transition-colors bg-transparent border-none cursor-pointer"
             >
               {copied ? (
-                <><FiCheck className="text-green-400" /> Copied</>
+                <>
+                  <FiCheck className="text-green-400" /> Copied
+                </>
               ) : (
-                <><FiCopy /> Copy invoice</>
+                <>
+                  <FiCopy /> Copy invoice
+                </>
               )}
             </button>
           </div>
         )}
 
-        <p className="text-white/20 text-xs text-center animate-pulse">Waiting for payment…</p>
+        <p className="text-white/20 text-xs text-center animate-pulse">
+          Waiting for payment…
+        </p>
+        <p className="text-yellow-400/50 text-xs text-center">
+          Do not refresh this page during payment
+        </p>
 
         <div className="flex flex-col gap-2">
           <button
