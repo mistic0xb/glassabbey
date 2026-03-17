@@ -10,7 +10,7 @@ import * as path from "path";
 import { randomUUID } from "crypto";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 8080;
-const LOCK_TIMEOUT_MS = 2 * 60 * 1000;
+const LOCK_TIMEOUT_MS = 1 * 60 * 1000;
 const CLEANUP_DELAY_MS = 60 * 1000;
 const NWC_WS_REFRESH_MS = 30_000;
 const NWC_FILE = path.join(process.cwd(), "nwc.json");
