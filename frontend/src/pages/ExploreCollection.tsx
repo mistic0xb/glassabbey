@@ -1,16 +1,169 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
+import { SimplePool } from "nostr-tools/pool";
 import { fetchPiecesByCollection } from "../libs/nostr/pieces";
 import { PieceCard } from "./admin/AddPieces";
 import type { Collection, Piece } from "../types/types";
+
+const RELAYS = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://nostr.mom",
+  "wss://relay.angor.io",
+];
+
+const pieceBidTag = (pieceId: string) => `glassabbey-bid:${pieceId}`;
+
+// Fetches current prices for a list of pieceIds from Nostr relays.
+// Mirrors the server-side fetchPriceFromNostr logic exactly:
+// currentPrice = willingAmt - submitAmt of the highest willingAmt bid.
+function usePiecePricesFromNostr(pieceIds: string[]): {
+  prices: Record<string, number>;
+  loading: boolean;
+} {
+  const [prices, setPrices] = useState<Record<string, number>>({});
+  const [loading, setLoading] = useState(false);
+  const fetchedRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!pieceIds.length) return;
+
+    const key = pieceIds.slice().sort().join(",");
+    if (fetchedRef.current === key) return;
+    fetchedRef.current = key;
+
+    setLoading(true);
+
+    const pool = new SimplePool();
+
+    // Track bids per piece: pieceId → { willingAmt, submitAmt }[]
+    const bidsByPiece: Record<string, { willingAmt: number; submitAmt: number }[]> = {};
+    pieceIds.forEach((id) => (bidsByPiece[id] = []));
+
+    // Subscribe to all pieces in one query using multiple #t filters
+    const tags = pieceIds.map(pieceBidTag);
+
+    let eoseCount = 0;
+
+    const flushPrices = () => {
+      const result: Record<string, number> = {};
+      for (const pieceId of pieceIds) {
+        const bids = bidsByPiece[pieceId] ?? [];
+        if (!bids.length) {
+          result[pieceId] = 0;
+          continue;
+        }
+        const top = bids.reduce((a, b) =>
+          b.willingAmt > a.willingAmt ? b : a,
+        );
+        result[pieceId] = top.willingAmt - top.submitAmt;
+      }
+      setPrices(result);
+      setLoading(false);
+    };
+
+    const timeout = setTimeout(() => {
+      sub.close();
+      pool.close(RELAYS);
+      flushPrices();
+    }, 8000);
+
+    const sub = pool.subscribeMany(
+      RELAYS,
+      { kinds: [30078], "#t": tags, limit: 500 },
+      {
+        onevent(event) {
+          try {
+            const data = JSON.parse(event.content) as {
+              willingAmt?: number;
+              submitAmt?: number;
+            };
+            if (!data.willingAmt || !data.submitAmt) return;
+
+            // Figure out which pieceId this event belongs to by matching its tags
+            const matchedTag = event.tags
+              .filter(([name]) => name === "t")
+              .map(([, val]) => val)
+              .find((val) => val.startsWith("glassabbey-bid:") && val !== "glassabbey-bid");
+
+            if (!matchedTag) return;
+            const pieceId = matchedTag.replace("glassabbey-bid:", "");
+            if (!bidsByPiece[pieceId]) return;
+
+            bidsByPiece[pieceId].push({
+              willingAmt: data.willingAmt,
+              submitAmt: data.submitAmt,
+            });
+          } catch {}
+        },
+        oneose() {
+          eoseCount++;
+          if (eoseCount >= RELAYS.length) {
+            clearTimeout(timeout);
+            sub.close();
+            pool.close(RELAYS);
+            flushPrices();
+          }
+        },
+      },
+    );
+
+    return () => {
+      clearTimeout(timeout);
+      try {
+        sub.close();
+        pool.close(RELAYS);
+      } catch {}
+    };
+  }, [pieceIds.slice().sort().join(",")]);
+
+  return { prices, loading };
+}
+
+const PriceBadge = ({
+  pieceId,
+  prices,
+  pricesLoading,
+}: {
+  pieceId: string;
+  prices: Record<string, number>;
+  pricesLoading: boolean;
+}) => {
+  const hasPrice = pieceId in prices;
+
+  if (pricesLoading && !hasPrice) {
+    return (
+      <div className="mt-2 px-3 pb-3">
+        <div className="h-6 rounded bg-white/5 animate-pulse w-24" />
+      </div>
+    );
+  }
+
+  const price = prices[pieceId] ?? 0;
+
+  return (
+    <div className="mt-2 px-3 pb-3 flex items-center justify-between">
+      <span className="text-[10px] text-white/30 uppercase tracking-widest">
+        {price === 0 ? "No bids yet" : "Current bid"}
+      </span>
+      {price > 0 && (
+        <span className="text-xs font-semibold text-amber-400">
+          {price.toLocaleString()} sats
+        </span>
+      )}
+    </div>
+  );
+};
 
 const ExploreCollection = () => {
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
   const { state } = useLocation() as { state: Collection | null };
-
   const [pieces, setPieces] = useState<Piece[]>([]);
   const [loading, setLoading] = useState(true);
+
+  const pieceIds = pieces.map((p) => p.id);
+  const { prices, loading: pricesLoading } = usePiecePricesFromNostr(pieceIds);
 
   useEffect(() => {
     if (!state?.pubkey || !id) return;
@@ -28,7 +181,6 @@ const ExploreCollection = () => {
 
   return (
     <div className="min-h-screen px-6 py-10 max-w-6xl mx-auto">
-
       {/* Back */}
       <button
         onClick={() => navigate("/explore")}
@@ -75,17 +227,24 @@ const ExploreCollection = () => {
             {pieces.map((piece) => (
               <div
                 key={piece.id}
-                onClick={() => navigate(`/piece/${piece.id}`, {
-                  state: {
-                    piece,
-                    collectionName: state.name,
-                    lightningAddress: state.lightningAddress,
-                    recipientPubkey: state.pubkey,
-                  },
-                })}
-                className="cursor-pointer"
+                onClick={() =>
+                  navigate(`/piece/${piece.id}`, {
+                    state: {
+                      piece,
+                      collectionName: state.name,
+                      lightningAddress: state.lightningAddress,
+                      recipientPubkey: state.pubkey,
+                    },
+                  })
+                }
+                className="cursor-pointer flex flex-col"
               >
                 <PieceCard piece={piece} collectionName={state.name} />
+                <PriceBadge
+                  pieceId={piece.id}
+                  prices={prices}
+                  pricesLoading={pricesLoading}
+                />
               </div>
             ))}
           </div>
