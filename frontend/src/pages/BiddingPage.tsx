@@ -9,8 +9,8 @@ import type { Piece, Collection } from "../types/types";
 const formatSats = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `${n}`;
 
-const BID_PRESETS = [1000, 5000, 10000, 50000, 100000, 250000];
-const SUBMIT_PRESETS = [10, 100];
+const BID_PRESETS = [5000, 10000, 21000,50000, 100000, 250000];
+const SUBMIT_PRESETS = [100];
 
 const PresetBtn = ({
   label,
