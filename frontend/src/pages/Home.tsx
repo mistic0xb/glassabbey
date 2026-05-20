@@ -65,7 +65,6 @@ const Home = () => {
           <p className="text-white/50 text-base">
             Welcome To The Auction House
           </p>
-          <p className="text-white/50 text-base">Claim History</p>
         </div>
         <div className="flex gap-3 mt-2">
           <a
